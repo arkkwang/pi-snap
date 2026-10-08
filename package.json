@@ -1,0 +1,39 @@
+{
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Compact Pi session snapshots for humans and agents",
+  "scripts": {
+    "test": "node --test test/*.test.mjs && bash test/snap.sh"
+  },
+  "name": "@arkkwang/pi-snap",
+  "license": "MIT",
+  "author": "arkkwang",
+  "files": [
+    "cli.mjs",
+    "snap.py",
+    "pi-snap",
+    "README.zh-CN.md"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/arkkwang/pi-snap.git"
+  },
+  "homepage": "https://github.com/arkkwang/pi-snap#readme",
+  "bugs": {
+    "url": "https://github.com/arkkwang/pi-snap/issues"
+  },
+  "keywords": [
+    "pi-agent",
+    "ai",
+    "cli"
+  ],
+  "bin": {
+    "pi-snap": "./cli.mjs"
+  }
+}
