@@ -24,29 +24,54 @@
 # [← 工具名](结果，独立记录) / [✦ compact]。
 #
 # 精简规则(快照模式):
-#   user 消息     正文截断 ~320 字符，换行折叠
-#   assistant     正文截断 ~200 字符；thinking 丢弃
+#   user 消息     正文截断 ~800 字符，换行折叠
+#   assistant     正文截断 ~600 字符；thinking 丢弃
 #   工具调用      一行: [→ 工具名] + 关键参数(bash 只显示命令，read 只显示路径等)
 #   工具结果      一行: [← 工具名] ok/ERR + 大小 + 耗时 + 前 ~100 字符；read 成功不透内容
 #   异常状态      [status] 显示 aborted/error/length 和最后保存的内容类型；错误结果保留摘要。
 # 未记录结果不等于正在执行或用户打断；JSONL 没落盘的流式进度无法恢复。
-#   system 消息   一行分区名/正文大小/工具变更数量；详情展开 sections 与工具定义
+#   system 消息   一行 cwd/Skills/MCP/Tools/Instructions 摘要；详情展开原文
 #   model_change 等元数据条目不显示(模型/会话名进头部)
 #
 import argparse
 import glob
 import json
 import os
+import re
 import shlex
 import sys
 from datetime import datetime
+from string import Formatter
 
 # ── 可调参数 ─────────────────────────────────────────────────────────────────
-USER_MAX, ASST_MAX = 320, 200     # user / assistant 正文截断
-ARGS_MAX, PEEK_MAX = 120, 100     # 工具调用参数 / 工具结果预览截断
+USER_MAX, ASST_MAX = 800, 600     # user / assistant 正文截断
+ARGS_MAX, PEEK_MAX = 120, 100     # 默认工具调用参数 / 工具结果预览截断
+# 工具输入摘要：max_chars 缺省用 ARGS_MAX；template 缺省展示整个参数 JSON。
+# 模板按参数名取值，缺失字段为空；:size 显示内容字符数，:count 显示条目数。
+# optional 片段仅在 when_any 中至少一个参数非 None 时追加；defaults 补缺失/None 字段。
+# truncate="middle" 保留前 1/3 和后 2/3；默认保留开头，不解析路径。
+# result 可覆盖结果模板、成功/错误预览长度；未配置的沿用下方默认值。
+RESULT_TEMPLATE = "{status} {size}{duration}"  # duration 有值时自带前导空格
+TOOL_SUMMARIES = {
+    "bash": {"max_chars": 600, "template": "{command}"},
+    "read": {
+        "template": "{path}",
+        "truncate": "middle",
+        "optional": [{
+            "when_any": ("offset", "limit"),
+            "template": " @{offset!s}+{limit!s}",
+            "defaults": {"offset": "?", "limit": "?"},
+        }],
+        "result": {"template": "{status} {lines} lines {size}", "preview_chars": 0},
+    },
+    "ls": {"template": "{path}", "truncate": "middle"},
+    "write": {"template": "{path} · {content:size}", "truncate": "middle"},
+    "edit": {"template": "{path} · {edits:count} 处修改", "truncate": "middle"},
+    "grep": {"template": "{pattern} · {path}"},
+    "find": {"template": "{pattern} · {path}"},
+}
 SUMMARY_MAX = 160                 # compaction 摘要截断
 LIST_LIMIT = 30                   # 列表模式最多显示几个会话
-READ_EXEMPT = {"read"}            # 这些工具的结果不透内容，只报行数/大小
 
 # 会话根目录: --session-dir 参数指定，默认 ~/.pi/agent/sessions。
 # 参数名与 pi 本体的 --session-dir 对齐。
@@ -77,12 +102,16 @@ def flatten(t):
     """换行/连续空白折叠成单个空格。"""
     return " ".join(str(t).split())
 
-def trunc(t, n):
-    """折叠空白后截断到 n 字符，超出补 …(+剩余字符数)。"""
+def trunc(t, n, mode="head"):
+    """保留 n 个原文字符，省略处标字符数；middle 偏重尾部，不解析路径。"""
     t = flatten(t)
     if len(t) <= n:
         return t
-    return f"{t[:n]} …(+{len(t) - n}c)"
+    omitted = f" …(+{len(t) - n}c)"
+    if mode == "middle" and n > 0:
+        head = n // 3
+        return t[:head] + omitted + " " + t[-(n - head):]
+    return t[:n] + omitted
 
 def fmt_size(n):
     if n < 1000:       return f"{n}c"
@@ -211,27 +240,75 @@ def active_branch(entries):
     return chain, by_id
 
 # ── 工具调用参数压缩 ─────────────────────────────────────────────────────────
+class SummaryFormatter(Formatter):
+    """模板仅增加通用的大小/计数格式，不包含工具名判断。"""
+    def get_value(self, key, args, kwargs):
+        return kwargs.get(key, "")
+
+    def format_field(self, value, format_spec):
+        if format_spec == "size":
+            return fmt_size(len(str(value or "")))
+        if format_spec == "count":
+            return str(len(value or []))
+        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        return super().format_field(flatten(text), format_spec)
+
+
+SUMMARY_FORMATTER = SummaryFormatter()
+
+
 def fmt_call_args(name, args):
-    """已知工具挑关键参数，其余整体 JSON 压一行。返回纯文本(不含颜色)。"""
-    a = args if isinstance(args, dict) else {}
-    def s(v):
-        return flatten(v) if isinstance(v, str) else flatten(json.dumps(v, ensure_ascii=False))
-    if name == "bash":
-        return s(a.get("command", ""))
-    if name == "read":
-        extra = ""
-        if "offset" in a or "limit" in a:
-            extra = f" @{a.get('offset', '?')}+{a.get('limit', '?')}"
-        return s(a.get("path", "")) + extra
-    if name == "ls":
-        return s(a.get("path", ""))
-    if name == "write":
-        return f"{s(a.get('path', ''))} · {fmt_size(len(str(a.get('content') or '')))}"
-    if name == "edit":
-        return f"{s(a.get('path', ''))} · {len(a.get('edits') or [])} 处修改"
-    if name in ("grep", "find"):
-        return f"{s(a.get('pattern', ''))} · {s(a.get('path', ''))}"
-    return s(a)
+    """配置模板选取参数；无模板或参数并非对象时保留原始参数摘要。"""
+    config = TOOL_SUMMARIES.get(name, {})
+    if "template" not in config or not isinstance(args, dict):
+        return flatten(args if isinstance(args, str) else json.dumps(args, ensure_ascii=False))
+    text = SUMMARY_FORMATTER.vformat(config["template"], (), args)
+    for part in config.get("optional", ()):
+        if any(args.get(key) is not None for key in part["when_any"]):
+            values = {**part.get("defaults", {}),
+                      **{key: value for key, value in args.items() if value is not None}}
+            text += SUMMARY_FORMATTER.vformat(part["template"], (), values)
+    return text
+
+def system_summary(m, tools=None, initial=False):
+    """只摘要本条保存的环境；工具总数由 parentId 分支上的增减记录重建。"""
+    parts = []
+    sections = m.get("sections") or {}
+    if "cwd" in sections:
+        parts.append("cwd=" + flatten(re.sub(r"</?cwd>", "", sections["cwd"])))
+    for key, label, pattern in (
+        ("skills", "Skills", r"<skill\s*>"),
+        ("mcp_servers", "MCP", r"(?m)^\s*-\s+mcp__[^\s]+"),
+    ):
+        if key in sections:
+            parts.append(f"{label}={len(re.findall(pattern, sections[key]))}")
+    added, removed = m.get("toolsAdded") or [], m.get("toolsRemoved") or []
+    if tools is not None or "toolsAdded" in m or "toolsRemoved" in m:
+        delta = []
+        if added:
+            delta.append(f"+{len(added)}")
+        if removed:
+            delta.append(f"-{len(removed)}")
+        # 初始完整工具列表无需重复标 +N；后续变更仍可定位。
+        suffix = "(" + "/".join(delta) + ")" if delta and not initial else ""
+        parts.append(f"Tools={len(tools) if tools is not None else '?'}{suffix}")
+    if "project_context" in sections:
+        count = len(re.findall(r"<project_instructions\b", sections["project_context"]))
+        parts.append(f"Instructions={count}")
+    content = m.get("content") or ""
+    size = len(content) if isinstance(content, str) else sum(
+        len(p.get("text", "")) for p in content if p.get("type") == "text")
+    size += sum(len(value) if isinstance(value, str) else
+                len(json.dumps(value, ensure_ascii=False)) for value in sections.values())
+    if size or sections:
+        parts.append(f"Prompt={fmt_size(size)}")
+    # 未识别的分区仍可发现，但不展开正文。
+    other = [k for k in sections if k not in
+             {"preamble", "cwd", "skills", "mcp_servers", "project_context"}]
+    if other or not parts and sections:
+        parts.append("sections=" + ", ".join(other or sections))
+    return " · ".join(parts) or "(empty)"
+
 
 # ── 快照渲染 ─────────────────────────────────────────────────────────────────
 def render_snapshot(entries, path, show_all, tail, sessions_dir=None, selector=None):
@@ -288,8 +365,20 @@ def render_snapshot(entries, path, show_all, tail, sessions_dir=None, selector=N
     seq = entries if show_all else chain
     # 在裁切 --tail 前一次索引调用和结果；默认只看当前分支，不拿旧分支的结果配对。
     pending, result_ids = {}, set()
+    tool_states, system_summaries = {}, {}
     for entry in seq:
         message = entry.get("message") or {}
+        tools = tool_states.get(entry.get("parentId"))
+        if message.get("role") == "system":
+            initial = tools is None and "toolsAdded" in message and not message.get("toolsRemoved")
+            if "toolsAdded" in message or "toolsRemoved" in message:
+                if tools is not None or "toolsAdded" in message:
+                    tools = set(tools or ())
+                    tools.difference_update(message.get("toolsRemoved") or [])
+                    tools.update(t["name"] for t in message.get("toolsAdded") or [])
+                    tools = frozenset(tools)
+            system_summaries[entry.get("id")] = system_summary(message, tools, initial)
+        tool_states[entry.get("id")] = tools
         if message.get("role") == "assistant":
             for part in message.get("content") or []:
                 if part.get("type") == "toolCall" and part.get("id"):
@@ -318,7 +407,8 @@ def render_snapshot(entries, path, show_all, tail, sessions_dir=None, selector=N
             continue
         if e.get("type") != "message":
             continue
-        lines = render_message(e, mark, ref_date, pending, result_ids)
+        lines = render_message(e, mark, ref_date, pending, result_ids,
+                               system_summaries.get(e.get("id")))
         if lines:
             print("\n".join(lines))
             first = False
@@ -331,7 +421,7 @@ def render_snapshot(entries, path, show_all, tail, sessions_dir=None, selector=N
                  + copy_prefix(sessions_dir) + shlex.quote(selector or sid) + " <entry-id>")
     print(dim("─" * 8 + " " + " · ".join(hints)))
 
-def render_message(e, mark, ref_date, pending, result_ids):
+def render_message(e, mark, ref_date, pending, result_ids, system_text=None):
     """单条 message 渲染成若干行；每行统一 [id] [time] [type] 内容。
     工具调用不是独立记录，沿用所属 assistant 条目的 id/时间；
     纯工具调用的条目不输出 [assistant] 行(它只表示 Agent 说的话)。"""
@@ -345,19 +435,8 @@ def render_message(e, mark, ref_date, pending, result_ids):
         head += " " + dim(f"[{tstr}]")
 
     if role == "system":
-        parts = []
-        sections = m.get("sections") or {}
-        if sections:
-            parts.append("sections=" + ", ".join(sections))
-        content = m.get("content") or ""
-        size = len(content) if isinstance(content, str) else sum(
-            len(p.get("text", "")) for p in content if p.get("type") == "text")
-        if size:
-            parts.append(f"content={size}c")
-        for key in ("toolsAdded", "toolsRemoved"):
-            if key in m:
-                parts.append(f"{key}={len(m[key] or [])}")
-        return [f"{head} {yellow('[system]')}  " + (" · ".join(parts) or "(empty)")]
+        return [f"{head} {yellow('[system]')}  "
+                + (system_text if system_text is not None else system_summary(m))]
 
     if role == "user":
         out = []
@@ -376,7 +455,9 @@ def render_message(e, mark, ref_date, pending, result_ids):
             if pt == "text" and str(p.get("text", "")).strip():
                 out.append(f"{head} {blue('[assistant]')}  {trunc(p.get('text', ''), ASST_MAX)}")
             elif pt == "toolCall":
-                args_s = trunc(fmt_call_args(p.get("name"), p.get("arguments")), ARGS_MAX)
+                config = TOOL_SUMMARIES.get(p.get("name"), {})
+                args_s = trunc(fmt_call_args(p.get("name"), p.get("arguments")),
+                               config.get("max_chars", ARGS_MAX), config.get("truncate", "head"))
                 note = ""
                 if p.get("id") not in result_ids:
                     note = " [未记录结果；是否开始执行未知]"
@@ -410,17 +491,16 @@ def render_message(e, mark, ref_date, pending, result_ids):
         if t0 and t1:
             dur = fmt_dur((t1 - t0).total_seconds() * 1000)
         status = red("ERR") if m.get("isError") else "ok"
-        meta = [status]
-        if name in READ_EXEMPT:
-            nlines = text.count("\n") + (1 if text else 0)
-            meta.append(f"{nlines} lines {fmt_size(len(text))}")
-        else:
-            meta.append(fmt_size(len(text)))
-            if dur:
-                meta.append(dur)
-        line = f"{head} {yellow('[← ' + name + ']')} {' '.join(meta)}"
-        if (name not in READ_EXEMPT or m.get("isError")) and text.strip():
-            line += "  " + trunc(text, PEEK_MAX)
+        config = TOOL_SUMMARIES.get(name, {}).get("result", {})
+        meta = config.get("template", RESULT_TEMPLATE).format(
+            status=status, size=fmt_size(len(text)),
+            lines=text.count("\n") + int(bool(text) and not text.endswith("\n")),
+            duration=" " + dur if dur else "")
+        line = f"{head} {yellow('[← ' + name + ']')} {meta}"
+        preview_key = "error_preview_chars" if m.get("isError") else "preview_chars"
+        preview_chars = config.get(preview_key, PEEK_MAX)
+        if preview_chars > 0 and text.strip():
+            line += "  " + trunc(text, preview_chars)
         if nimg:
             line += dim("  [image]")
         return [line]

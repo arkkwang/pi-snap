@@ -33,6 +33,25 @@ The default session root is `~/.pi/agent/sessions`. Use `--session-dir` for cust
 
 Snapshots shorten user/assistant text, tool arguments, and results, and omit thinking. Full-record views can reveal the original content. By default, only the branch ending at the last record is shown; `--all` marks other branches with `~`.
 
+Display rules live at the top of `snap.py`: `USER_MAX=800`, `ASST_MAX=600`, default tool input `ARGS_MAX=120`, and result preview `PEEK_MAX=100`. `TOOL_SUMMARIES` configures input templates, limits and result summaries by tool name, without tool-specific rendering branches. For example:
+
+```python
+"bash": {"max_chars": 600, "template": "{command}"},
+"tool_search": {"max_chars": 400},  # No template: keep the entire arguments JSON
+"example": {
+    "template": "{path} · {items:count}",
+    "result": {"template": "{status} {lines} lines {size}", "preview_chars": 0},
+},
+```
+
+- Input templates select arguments by name; `:size` formats content character counts and `:count` counts items. Missing fields are empty. Optional segments require at least one non-`None` value in `when_any`; `defaults` fills missing or `None` values, while zero remains valid. See the Read configuration.
+- Unconfigured tools or entries without an input template use the entire arguments JSON on one line. Non-object arguments retain their content rather than becoming an empty object. Input limits apply with an omitted-character count. `truncate="middle"` preserves the first third and last two thirds for Read/Write/Edit/ls paths and suffixes, without parsing paths. Extremely long filenames may still be shortened, retaining their ending. The default preserves the beginning.
+- Result templates support `{status}`, `{size}`, `{lines}`, and `{duration}` (including a leading space when present). The default shows status, size and duration. `preview_chars` controls successful-result previews; `error_preview_chars` independently controls error previews. Both default to 100; zero disables that preview. Read suppresses only successful-result previews. Image markers remain visible.
+
+Limits count characters after whitespace folding; original records and full views are unchanged.
+
+System summaries stay on one line: `cwd=… · Skills=13 · MCP=5 · Tools=6 · Instructions=1 · Prompt=8.2Kc`. Counts refer to available skills, MCP servers, tools, and project instruction blocks; absent sections are omitted. Tool inventories follow each parentId branch, with subsequent changes shown as `Tools=8(+2)`, including when using `--tail`. Prompt counts characters in this record's sections and content (1Kc = 1000 characters), not tokens, excluding tool definitions. Incremental records do not represent the full context size.
+
 ## Investigation workflow for humans and agents
 
 1. List recent sessions and choose an ID, or provide a log file directly.

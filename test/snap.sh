@@ -439,8 +439,8 @@ with open(sys.argv[1], "w", encoding="utf-8") as f:
         f.write(json.dumps(e, ensure_ascii=False) + "\n")
 PYFIX
 out="$(run "$system_file")"
-grep -q 'sys1.*\[system\].*preamble.*project_context.*toolsAdded=1' <<<"$out" || fail "system: 缺分区/工具摘要"
-grep -q 'sys2.*\[system\].*toolsRemoved=1' <<<"$out" || fail "system: 缺移除摘要"
+grep -q 'sys1.*\[system\].*Tools=1.*Instructions=0' <<<"$out" || fail "system: 缺环境/工具摘要"
+grep -q 'sys2.*\[system\].*Tools=0(-1)' <<<"$out" || fail "system: 缺移除摘要"
 grep -q 'sys3.*\[system\]' <<<"$out" || fail "system: 缺文本块摘要"
 grep -q 'SYSTEM-SECRET' <<<"$out" && fail "system: 快照不应展开正文"
 out="$(run "$system_file" sys1)"
@@ -455,3 +455,4 @@ grep -q '文本块正文' <<<"$out" || fail "system detail: 文本块缺失"
 out="$(run "$system_file" sys1 --json)"
 grep -q 'sections' <<<"$out" || fail "system json: 原始分区缺失"
 printf 'PASS: system summary / sections / tool changes / string and block content / raw JSON\n'
+python3 "$root/test/summary.py"

@@ -33,6 +33,25 @@ bash pi-snap /path/to/session.jsonl
 
 快照压缩用户/助手正文、工具调用和结果，隐藏 thinking；单条详情可以展开完整内容。默认只展示最后记录所在的 parentId 分支，`--all` 用 `~` 标记其他分支。工具结果缺失不等于正在执行，也不能证明用户取消；尚未落盘的流式进度无法恢复。
 
+展示规则集中配置在 `snap.py` 顶部：`USER_MAX=800`、`ASST_MAX=600`、默认工具输入 `ARGS_MAX=120`、结果预览 `PEEK_MAX=100`。`TOOL_SUMMARIES` 按工具名配置输入模板、长度和结果摘要，无需增加工具名判断。例如：
+
+```python
+"bash": {"max_chars": 600, "template": "{command}"},
+"tool_search": {"max_chars": 400},  # 无模板：保留整个参数 JSON
+"example": {
+    "template": "{path} · {items:count}",
+    "result": {"template": "{status} {lines} lines {size}", "preview_chars": 0},
+},
+```
+
+- 输入模板按参数名取值；`:size` 显示内容字符数，`:count` 显示条目数。缺失字段为空；可选片段的 `when_any` 要求至少一个参数非 `None`，`defaults` 补缺失或 `None` 值，`0` 仍是有效值。用法见 Read 配置。
+- 未配置工具或未配置输入模板时，展示整个参数的单行 JSON；非对象参数保留其内容，不丢成空对象。统一按输入上限截断，保留省略字符数。`truncate="middle"` 保留前 1/3 和后 2/3，适用于 Read/Write/Edit/ls 的路径及后缀；不解析路径，超长文件名仍可能缩短，但保留末尾。默认保留开头。
+- 结果模板可用 `{status}`、`{size}`、`{lines}`、`{duration}`（耗时有值时自带前导空格）。默认是状态、大小、耗时；`preview_chars` 控制成功预览，`error_preview_chars` 独立控制错误预览，均缺省为 100，设为 0 不预览。Read 只关闭成功预览；图片标记仍保留。
+
+长度按折叠空白后的字符数计算，不影响原始记录和详情。
+
+System 概览保持一行：`cwd=… · Skills=13 · MCP=5 · Tools=6 · Instructions=1 · Prompt=8.2Kc`。Skills 是可用条目数，MCP 是服务器数，Instructions 是项目指令块数；缺失分区不显示。Tools 沿各自 parentId 分支累计，后续增减显示为 `Tools=8(+2)`，`--tail` 不影响累计。Prompt 是本条记录中各提示词分区与正文的字符数（1Kc=1000 字符），不是 token 数，不含工具定义；增量记录不代表完整上下文大小。
+
 ## 人与 Agent 的排查流程
 
 1. 列出最近会话，选定 ID；也可以直接传入日志文件路径。
