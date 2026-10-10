@@ -14,7 +14,7 @@ with tempfile.TemporaryDirectory(prefix="pi snap benchmark ") as directory:
     rows = [dict(type="session", version=3, id="bench", cwd=directory)]
     rows += [message(f"u{i}", f"u{i-1}" if i else None, "user", "x" * 100) for i in range(20000)]
     source.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
-    for mode in ("read+branch", "fork"):
+    for mode in ("read+branch", "dialogue", "trace", "fork"):
         if mode == "fork" and not hasattr(snap, "export_fork"):
             continue
         elapsed = []
@@ -25,6 +25,10 @@ with tempfile.TemporaryDirectory(prefix="pi snap benchmark ") as directory:
                     snap.main([str(source), "u19999", "--fork", str(Path(directory) / f"fork-{i}.jsonl")])
                 else:
                     entries = snap.load_entries(source)
-                    snap.active_branch(entries)
+                    if mode in ("dialogue", "trace"):
+                        snap.render_snapshot(entries, str(source), False, 20,
+                                             trace=mode == "trace")
+                    else:
+                        snap.active_branch(entries)
             elapsed.append(time.perf_counter() - start)
         print(f"{mode}: 20,000 entries, median of 5 warm runs = {statistics.median(elapsed[1:]) * 1000:.1f} ms")

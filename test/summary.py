@@ -150,7 +150,7 @@ s4 = entry('s4', 's3', role='system', toolsRemoved=['bash'])
 def snapshot(entries, all=False, tail=None):
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
-        api['render_snapshot'](entries, 'fixture', all, tail)
+        api['render_snapshot'](entries, 'fixture', all, tail, trace=True)
     return out.getvalue()
 
 

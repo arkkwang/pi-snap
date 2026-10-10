@@ -47,7 +47,7 @@ grep -q "看这个文件" <<<"$out" || fail "list: 缺第一会话预览"
 grep -q "aaa11111" <<<"$out" || fail "list: 缺会话 id"
 
 # ── 快照: 头部 + 精简规则 ────────────────────────────────────────────────────
-out="$(run aaa11111)"
+out="$(run aaa11111 --trace)"
 grep -q "session $S1" <<<"$out" || fail "snap: 头部 id 错"
 grep -q "model anthropic/test-model" <<<"$out" || fail "snap: 头部模型缺"
 grep -q "内部思考不应出现" <<<"$out" && fail "snap: thinking 不应出现"
@@ -66,7 +66,7 @@ out="$(run aaa11111 --all)"
 grep -q "~\[u200000a\].*\[user\].*被回退的消息" <<<"$out" || fail "--all: 回退条目应带 ~ 标记"
 
 # ── --tail ──────────────────────────────────────────────────────────────────
-out="$(run aaa11111 --tail 2)"
+out="$(run aaa11111 --trace --tail 2)"
 grep -q "看这个文件" <<<"$out" && fail "--tail: 早于尾部的不应出现"
 grep -q "✦ compact" <<<"$out" || fail "--tail: 尾部 compact 缺"
 
@@ -121,7 +121,7 @@ api = runpy.run_path(sys.argv[1])
 def capture(fn, *args):
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
-        api[fn](*args)
+        api[fn](*args, **({'trace': True} if fn == 'render_snapshot' else {}))
     return out.getvalue()
 
 def entry(id, parent, message, second=1):
@@ -438,7 +438,7 @@ with open(sys.argv[1], "w", encoding="utf-8") as f:
     for e in entries:
         f.write(json.dumps(e, ensure_ascii=False) + "\n")
 PYFIX
-out="$(run "$system_file")"
+out="$(run "$system_file" --trace)"
 grep -q 'sys1.*\[system\].*Tools=1.*Instructions=0' <<<"$out" || fail "system: 缺环境/工具摘要"
 grep -q 'sys2.*\[system\].*Tools=0(-1)' <<<"$out" || fail "system: 缺移除摘要"
 grep -q 'sys3.*\[system\]' <<<"$out" || fail "system: 缺文本块摘要"
@@ -457,3 +457,5 @@ grep -q 'sections' <<<"$out" || fail "system json: 原始分区缺失"
 printf 'PASS: system summary / sections / tool changes / string and block content / raw JSON\n'
 python3 "$root/test/summary.py"
 python3 "$root/test/fork.py"
+
+python3 "$root/test/dialogue.py"

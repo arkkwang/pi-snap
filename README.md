@@ -2,7 +2,7 @@ English | [简体中文](README.zh-CN.md)
 
 # pi-snap
 
-Compact execution snapshots and session fork exports for humans and agents using official [Pi](https://github.com/earendil-works/pi). Find failures, inspect tool calls, expand individual records, and export an independent session at a selected entry. Source sessions are never modified. No running Pi instance or model requests required.
+Dialogue-first session browsing, execution snapshots, and session fork exports for humans and agents using official [Pi](https://github.com/earendil-works/pi). Understand requests and discussion first, then inspect tool calls, expand individual records, and export an independent session at a selected entry. Source sessions are never modified. No running Pi instance or model requests required.
 
 ## Install and use
 
@@ -12,9 +12,10 @@ Requires Python 3.10+. npm installation also requires Node.js 22.19+ and does **
 npm install -g @arkkwang/pi-snap
 pi-snap --help
 pi-snap                              # Recent sessions
-pi-snap <session-id>                 # Compact current-branch snapshot
+pi-snap <session-id>                 # Full dialogue on the current branch
+pi-snap <session-id> --trace          # Compact execution view
 pi-snap <session-id> --all            # Include discarded branches
-pi-snap <session-id> --tail 20        # Last 20 records
+pi-snap <session-id> --tail 20        # Last 20 visible records in this view
 pi-snap <session-id> <entry-id>       # Full record content
 pi-snap <session-id> <entry-id> --json
 pi-snap --session-dir /path/to/sessions
@@ -31,9 +32,30 @@ bash /absolute/path/to/pi-snap/pi-snap <session-id>
 
 The default session root is `~/.pi/agent/sessions`. Use `--session-dir` for custom Pi data locations. Select a session by a header ID prefix, filename prefix, or JSONL path; ambiguous prefixes produce a diagnostic.
 
-Snapshots shorten user/assistant text, tool arguments, and results, and omit thinking. Full-record views can reveal the original content. By default, only the branch ending at the last record is shown; `--all` marks other branches with `~`.
+The default view preserves complete user/assistant text and line breaks, with `[image]` placeholders for user images. Thinking, system messages, tool arguments and results are hidden. Between text messages, tool calls are grouped by name: `↳ 工具调用：bash × 3 · read × 2`. Counts come from saved toolCall blocks, not results; they do not prove execution or success. Calls inside Code Mode are not inferred from scripts or output. Aggregate lines have no invented entry IDs and do not count toward `--tail`.
 
-Display rules live at the top of `snap.py`: `USER_MAX=800`, `ASST_MAX=600`, default tool input `ARGS_MAX=120`, and result preview `PEEK_MAX=100`. `TOOL_SUMMARIES` configures input templates, limits and result summaries by tool name, without tool-specific rendering branches. For example:
+`--trace` shows compact execution records, including calls, results, system summaries, compactions and interruption states. Full-record views reveal original content. Both views default to the branch ending at the last record; `--all` includes other branches and marks their records/tool counts with `~`.
+
+## Expand a discussion segment
+
+```bash
+pi-snap SESSION
+pi-snap SESSION --trace --since ID1 --before ID2
+pi-snap SESSION ENTRY
+pi-snap SESSION ENTRY --json
+```
+
+- All views, ranges and details use original entry IDs, never renumbered. Unique prefixes work; missing, ambiguous or duplicate IDs fail explicitly.
+- `--since ID1` includes its boundary; `--before ID2` excludes it. Either boundary is optional. Ordering follows the record chain, not timestamps or lexical ID order.
+- Bounds may refer to tool records or dialogue records. Off-branch or reversed bounds fail; identical bounds produce an explicitly empty range.
+- Ranges cannot be combined with `--all`, preventing silent cross-branch stitching.
+- Selection order: branch → range → view filter → `--tail N`. N must be positive. There is no implicit tail limit, including for ranges. Truncation reports omitted visible records; tool counts cover only the retained span.
+- Mixed assistant records keep their text and aggregate their tool calls. A trace record with multiple calls counts once toward `--tail`, not once per output line.
+- Trace inventories and call/result pairing use the whole selected branch: a result outside the displayed window is not a missing result.
+
+### Execution-view formatting
+
+`--trace` display rules live at the top of `snap.py`: `USER_MAX=800`, `ASST_MAX=600`, default tool input `ARGS_MAX=120`, and result preview `PEEK_MAX=100`. `TOOL_SUMMARIES` configures input templates, limits and result summaries by tool name, without tool-specific rendering branches. For example:
 
 ```python
 "bash": {"max_chars": 600, "template": "{command}"},
@@ -55,10 +77,11 @@ System summaries stay on one line: `cwd=… · Skills=13 · MCP=5 · Tools=6 · 
 ## Investigation workflow for humans and agents
 
 1. List recent sessions and choose an ID, or provide a log file directly.
-2. Inspect a compact snapshot (`--tail 20` for a shorter view) for tool errors, abnormal termination, or missing results.
-3. Expand the relevant entry ID. Add `--json` when you need the original record structure.
+2. Read the default dialogue view (`--tail 20` for a shorter view) to understand requests, corrections, and conclusions.
+3. Use the same IDs with `--trace --since ID1 --before ID2` to examine the relevant execution segment.
+4. Expand an individual entry ID; add `--json` for the original record structure.
 
-Use snapshots to narrow the search and full records to verify evidence. Truncation and missing results prove neither success nor ongoing execution. Unsaved streaming progress cannot be recovered. `--json` currently applies to a single entry, not the entire session.
+Assistant claims and tool counts are not success evidence. Use execution snapshots to narrow the search and full records to verify evidence. Truncation and missing results prove neither success nor ongoing execution. Unsaved streaming progress cannot be recovered. `--json` currently applies to a single entry, not the entire session.
 
 ## Fork a session
 
@@ -72,7 +95,7 @@ Select an entry ID from a snapshot (unique prefixes also work). The export follo
 The new header gets a fresh session ID, timestamp, and `parentSession` pointing to the source file. Other header fields and all selected records are preserved, including thinking, images, system records, model settings, compactions, and labels. No summaries are recomputed and no later information is imported. Change models/prompts and continue through your resume interface. Export does not restore files, processes, or external services, nor guarantee that a resume interface treats logged system records as its active system prompt.
 
 - Requires a v3 session, a non-existing destination file, and an existing parent directory. Success prints the absolute output path to stdout.
-- Cannot be combined with `--all`, `--tail`, or `--json`.
+- Cannot be combined with `--all`, `--tail`, `--trace`, `--since`, `--before`, or `--json`.
 - Malformed lines, duplicate IDs, broken/cyclic ancestry, invalid compaction references, and unpaired tool results fail export rather than silently losing or inventing records. Select a point before a tool batch or after all its results.
 - Only persisted records are exported. External attachment references remain the caller's responsibility.
 

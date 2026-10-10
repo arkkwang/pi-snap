@@ -2,7 +2,7 @@
 
 # pi-snap
 
-为人和 Agent 提供官方 [Pi](https://github.com/earendil-works/pi) 会话的精简执行快照与分叉导出：快速看懂执行过程、定位工具错误、展开原始记录，并从选定记录导出独立会话。不修改原会话，不依赖正在运行的 Pi，不发送模型请求。
+为人和 Agent 提供官方 [Pi](https://github.com/earendil-works/pi) 会话的对话脉络、执行快照与分叉导出：先理解用户目标和讨论转折，再定位工具错误、展开原始记录，并从选定记录导出独立会话。不修改原会话，不依赖正在运行的 Pi，不发送模型请求。
 
 ## 使用
 
@@ -20,9 +20,10 @@ pi-snap --help
 ```bash
 bash pi-snap --help
 bash pi-snap                         # 最近会话
-bash pi-snap <session-id>            # 当前分支的精简执行记录
+bash pi-snap <session-id>            # 当前分支的完整对话脉络
+bash pi-snap <session-id> --trace    # 精简执行视图：工具、结果与状态
 bash pi-snap <session-id> --all      # 包含回退分支
-bash pi-snap <session-id> --tail 20  # 最后 20 条记录
+bash pi-snap <session-id> --tail 20  # 当前视图最后 20 条可显示记录
 bash pi-snap <session-id> <entry-id> # 完整内容
 bash pi-snap <session-id> <entry-id> --json
 bash pi-snap --session-dir /path/to/sessions
@@ -31,9 +32,30 @@ bash pi-snap /path/to/session.jsonl
 
 从其他目录调用时使用 `bash /absolute/path/to/pi-snap/pi-snap ...`。默认读取 `~/.pi/agent/sessions`；支持会话 ID 前缀、文件名前缀或 JSONL 路径，前缀不唯一时会提示。自定义 Pi 数据目录请显式传 `--session-dir`。
 
-快照压缩用户/助手正文、工具调用和结果，隐藏 thinking；单条详情可以展开完整内容。默认只展示最后记录所在的 parentId 分支，`--all` 用 `~` 标记其他分支。工具结果缺失不等于正在执行，也不能证明用户取消；尚未落盘的流式进度无法恢复。
+默认只显示用户和 Assistant 的正文，保留完整文字与换行；图片用 `[image]` 占位，不展开 thinking、system、工具参数或结果。相邻正文之间按工具名聚合调用次数，例如 `↳ 工具调用：bash × 3 · read × 2`。次数来自已保存的 toolCall，不把结果重复计数，也不表示执行成功；Code Mode 内部调用不从代码或结果中推测。摘要不编造记录 ID、不占 `--tail` 条数。
 
-展示规则集中配置在 `snap.py` 顶部：`USER_MAX=800`、`ASST_MAX=600`、默认工具输入 `ARGS_MAX=120`、结果预览 `PEEK_MAX=100`。`TOOL_SUMMARIES` 按工具名配置输入模板、长度和结果摘要，无需增加工具名判断。例如：
+`--trace` 切换为精简执行视图，包含工具调用、结果、system、compaction 和中断状态；单条详情可以展开完整内容。默认仅展示最后记录所在的 parentId 分支，`--all` 加入其他分支并用 `~` 标记其记录和工具计数。
+
+## 从脉络展开执行区间
+
+```bash
+pi-snap SESSION
+pi-snap SESSION --trace --since ID1 --before ID2
+pi-snap SESSION ENTRY
+pi-snap SESSION ENTRY --json
+```
+
+- 所有视图、区间和详情都使用原始记录 ID，不重新编号；支持唯一前缀。不存在、前缀歧义或重复 ID 会报错。
+- `--since ID1` 包含起点，`--before ID2` 不包含终点。可以只指定一端；顺序以记录链为准，不比较 ID 字符串或时间。
+- 边界可以是工具记录，也可以是对话记录。边界不在当前分支或起点晚于终点时失败；两端相同是空区间，会明确提示。
+- 区间暂不与 `--all` 混用，避免悄悄拼接不同分支。
+- 顺序为：选分支 → 定位区间 → 按视图过滤 → `--tail N`。N 必须为正整数；默认无条数限制，指定区间也不隐式截尾。工具摘要只统计保留范围内的调用，丢弃的头部数量会明确显示。
+- 同一 Assistant 记录可能同时含正文和多个调用：正文仍显示，调用次数聚合；`--trace --tail` 按记录数而非输出行数计算。
+- 执行摘要的工具清单与调用配对参考完整所选分支，不能因为结果在窗口之外就误报「未记录结果」。
+
+### 执行视图的精简规则
+
+`--trace` 的展示规则集中配置在 `snap.py` 顶部：`USER_MAX=800`、`ASST_MAX=600`、默认工具输入 `ARGS_MAX=120`、结果预览 `PEEK_MAX=100`。`TOOL_SUMMARIES` 按工具名配置输入模板、长度和结果摘要，无需增加工具名判断。例如：
 
 ```python
 "bash": {"max_chars": 600, "template": "{command}"},
@@ -55,10 +77,11 @@ System 概览保持一行：`cwd=… · Skills=13 · MCP=5 · Tools=6 · Instruc
 ## 人与 Agent 的排查流程
 
 1. 列出最近会话，选定 ID；也可以直接传入日志文件路径。
-2. 先看精简快照（大输出可用 `--tail 20`），定位报错工具、异常结束或缺失结果。
-3. 用快照中的 entry ID 展开详情；需要保留原始结构时加 `--json`。
+2. 默认先看对话脉络（大输出可用 `--tail 20`），理解需求、纠正和结论。
+3. 用同一组 ID 搭配 `--trace --since ID1 --before ID2` 展开有疑问的一段，核对执行过程。
+4. 用 entry ID 展开单条详情；需要保留原始结构时加 `--json`。
 
-快照用于缩小范围，详情用于核对证据。Agent 无需把整份 JSONL 塞进上下文；截断内容和缺失结果都不能作为任务成功或仍在运行的证明。`--json` 当前只用于单条记录，不是全会话 JSON 模式。
+对话中的结论和工具次数不是成功证明；执行视图用于缩小范围，详情用于核对证据。Agent 无需把整份 JSONL 塞进上下文；截断内容和缺失结果都不能作为任务成功或仍在运行的证明。`--json` 当前只用于单条记录，不是全会话 JSON 模式。
 
 ## 会话分叉
 
@@ -72,7 +95,7 @@ pi --session ./retry.jsonl
 新文件使用新会话 ID、生成时间和指向源文件的 `parentSession`，其余头部字段及路径上的记录原样保留，包括 thinking、图片、系统记录、模型设置、压缩与标签。不重算摘要，不从后续记录补信息。换模型、调整提示词和继续执行交给恢复入口；这里仅导出 JSONL，不恢复工作区、进程或外部服务，也不保证恢复工具会把日志中的系统记录直接用作当前系统提示词。
 
 - 仅支持 v3 会话；目标文件必须不存在，父目录须已存在。成功时 stdout 输出新文件的绝对路径。
-- 不允许与 `--all`、`--tail`、`--json` 混用。
+- 不允许与 `--all`、`--tail`、`--trace`、`--since`、`--before`、`--json` 混用。
 - 导出遇到坏行、重复 ID、断裂或循环的祖先链、无效压缩引用、缺少配对的工具结果会失败，不静默补齐或丢弃记录。多个工具调用必须全部返回后再选截止点，或选调用之前的记录。
 - 所有内容取自已落盘记录；附件中的外部引用仍由调用方负责。
 
@@ -93,7 +116,7 @@ npm test
 bash test/snap.sh
 ```
 
-使用临时合成会话，覆盖分支、截断、错误、前缀定位、重复 ID、路径空格、大输入、分叉完整性、不覆盖源文件及 npm 入口；不读取私人会话或调用模型。
+使用临时合成会话，覆盖对话全文、混合正文/工具记录、工具计数、稳定 ID、区间边界、过滤后截尾、分支、截断、错误、前缀定位、重复 ID、路径空格、大输入、分叉完整性、不覆盖源文件及 npm 入口；不读取私人会话或调用模型。
 
 可选 SDK 契约测试：将 `PI_SNAP_SESSION_MANAGER` 设为本机 Pi 的 `dist/core/session-manager.js` 路径，再运行 `npm test`，会用真实 `SessionManager` 打开导出文件，并比较截止点的恢复上下文。未设置时只跑 CLI 回归，不自动安装 Pi。性能复测：`python3 test/benchmark.py`（20,000 条合成记录，预热后 5 次中位数）。
 
