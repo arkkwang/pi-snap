@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# pi-snap — Pi Agent 会话执行快照（只读 CLI，不依赖 pi 运行时）。
+# pi-snap — Pi Agent 会话执行快照与分叉导出（不修改原会话，不依赖 pi 运行时）。
 #
 # 会话记录: ~/.pi/agent/sessions/<cwd 目录名>/<时间戳>_<uuid>.jsonl
 # 每行一个 JSON 对象(记录)，id/parentId 构成一棵树；回退(rewind)后继续是往树上
@@ -15,6 +15,7 @@
 #   pi-snap <session> --tail N       只看最后 N 条记录(大 session 配合管道用)
 #   pi-snap <session> <entry-id>     查看某条记录的完整内容(快照中被截断的原文)
 #   pi-snap <session> <entry-id> --json   该条记录的原始 JSON
+#   pi-snap <session> <entry-id> --fork out.jsonl  导出含截止点的独立会话
 #   pi-snap --session-dir <path> ... 指定会话根目录(递归查找其下 .jsonl；测试时
 #                                    session 不在 ~/.pi 下；也可直接传 jsonl
 #                                    文件路径作为 session 参数)
@@ -40,7 +41,8 @@ import os
 import re
 import shlex
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
+from uuid import uuid4
 from string import Formatter
 
 # ── 可调参数 ─────────────────────────────────────────────────────────────────
@@ -211,18 +213,23 @@ def find_session(prefix, sessions_dir):
     return matches[0]
 
 # ── 加载与分支 ───────────────────────────────────────────────────────────────
-def load_entries(path):
-    """逐行解析 JSONL；坏行(比如正在写入的半行)跳过。"""
+def load_entries(path, strict=False):
+    """查看时跳过坏行；导出时拒绝损坏或非对象记录，避免静默丢失上下文。"""
     entries = []
     bad = 0
-    with open(path, encoding="utf-8", errors="replace") as fh:
-        for line in fh:
+    with open(path, encoding="utf-8", errors="strict" if strict else "replace") as fh:
+        for line_number, line in enumerate(fh, 1):
             line = line.strip()
             if not line:
                 continue
             try:
-                entries.append(json.loads(line))
+                entry = json.loads(line)
+                if strict and not isinstance(entry, dict):
+                    die(f"第 {line_number} 行不是记录对象，无法分叉")
+                entries.append(entry)
             except ValueError:
+                if strict:
+                    die(f"第 {line_number} 行 JSON 损坏，无法分叉；请等待写入完成或使用完整记录")
                 bad += 1
     if bad:
         print(dim(f"(跳过 {bad} 行无法解析的记录)"), file=sys.stderr)
@@ -238,6 +245,84 @@ def active_branch(entries):
         cur = by_id.get(cur.get("parentId"))
     chain.reverse()
     return chain, by_id
+
+def export_fork(entries, source, ref, destination):
+    """按 parentId 提取包含截止点的路径；不拼接旁支，也不执行工具。"""
+    header = entries[0]
+    if (header.get("type") != "session" or header.get("version") != 3
+            or not isinstance(header.get("id"), str) or not header["id"]):
+        die("分叉需要 Pi v3 session 头部")
+    by_id = {}
+    for entry in entries[1:]:
+        eid = entry.get("id")
+        parent = entry.get("parentId")
+        if (entry.get("type") == "session" or not isinstance(eid, str) or not eid
+                or eid in by_id or eid == header["id"] or "parentId" not in entry
+                or (parent is not None and not isinstance(parent, str))):
+            die("记录 id 重复、缺失或 parentId 无效，无法分叉")
+        by_id[eid] = entry
+    current = find_entry(entries[1:], ref)
+    chain, seen = [], set()
+    while current is not None:
+        eid = current["id"]
+        if eid in seen:
+            die("parentId 存在循环，无法分叉")
+        seen.add(eid)
+        chain.append(current)
+        parent = current["parentId"]
+        if parent is not None and parent not in by_id:
+            die(f"缺少父记录 {parent!r}，无法分叉")
+        current = by_id.get(parent)
+    chain.reverse()
+
+    # 所有工具返回必须来自本分支的请求；不能从并行调用的中途导出。
+    pending, preceding = set(), set()
+    for entry in chain:
+        preceding.add(entry["id"])
+        if entry.get("type") == "compaction":
+            kept = entry.get("firstKeptEntryId")
+            if not isinstance(kept, str) or kept not in preceding:
+                die("压缩记录 firstKeptEntryId 不在此前路径中，无法分叉")
+        if entry.get("type") != "message":
+            continue
+        msg = entry.get("message")
+        if not isinstance(msg, dict):
+            die("message 记录无效，无法分叉")
+        if msg.get("role") == "assistant":
+            if pending:
+                die("此前工具调用缺少返回，无法分叉")
+            content = msg.get("content") or []
+            for part in content if isinstance(content, list) else []:
+                if isinstance(part, dict) and part.get("type") == "toolCall":
+                    call_id = part.get("id")
+                    if not isinstance(call_id, str) or not call_id or call_id in pending:
+                        die("工具调用 id 缺失或重复，无法分叉")
+                    pending.add(call_id)
+        elif msg.get("role") == "toolResult":
+            call_id = msg.get("toolCallId")
+            if not isinstance(call_id, str) or call_id not in pending:
+                die("工具返回缺少匹配的调用，无法分叉")
+            pending.remove(call_id)
+        elif msg.get("role") == "user" and pending:
+            die("此前工具调用缺少返回，无法分叉")
+    if pending:
+        die("截止点仍有工具调用缺少返回；请选择调用前或所有返回之后的记录")
+
+    fork_header = dict(header, id=str(uuid4()),
+                       timestamp=datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                       parentSession=os.path.abspath(source))
+    # x 模式原子地拒绝已有路径（也保护源文件及指向源文件的链接）。
+    output = open(destination, "x", encoding="utf-8", newline="\n")
+    try:
+        with output:
+            output.write(json.dumps(fork_header, ensure_ascii=False) + "\n")
+            for entry in chain:
+                output.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except BaseException:
+        os.unlink(destination)
+        raise
+    print(os.path.abspath(destination))
+
 
 # ── 工具调用参数压缩 ─────────────────────────────────────────────────────────
 class SummaryFormatter(Formatter):
@@ -654,7 +739,7 @@ def render_entry_full(e, on_branch, as_json):
 def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="pi-snap",
-        description="Pi Agent 会话执行快照(只读)。显示已保存的中断/错误状态；"
+        description="Pi Agent 会话执行快照与分叉导出(不修改原会话)。显示已保存的中断/错误状态；"
                     "未记录结果不等于正在执行或用户打断，未落盘的流式进度不可恢复。",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="示例:\n"
@@ -673,7 +758,14 @@ def main(argv=None):
     ap.add_argument("--all", action="store_true", help="包含被回退丢弃的分支记录")
     ap.add_argument("--tail", type=int, metavar="N", help="只看最后 N 条记录")
     ap.add_argument("--json", action="store_true", help="配合 entry: 输出原始 JSON")
+    ap.add_argument("--fork", metavar="PATH", help="导出截至 entry(含)的独立 v3 会话；目标必须不存在，不恢复环境")
     args = ap.parse_args(argv)
+
+    if args.fork is not None:
+        if not args.session or not args.entry:
+            ap.error("--fork 需要指定 session 和 entry id")
+        if args.json or args.all or args.tail is not None:
+            ap.error("--fork 不能与 --json、--all 或 --tail 一起使用")
 
     if args.json and not args.entry:
         ap.error("--json 需要指定 entry id")
@@ -690,9 +782,15 @@ def main(argv=None):
         return
 
     path = find_session(args.session, sessions_dir)
-    entries = load_entries(path)
-    if not entries:
-        die(f"会话文件为空: {path}")
+    try:
+        entries = load_entries(path, strict=args.fork is not None)
+        if not entries:
+            die(f"会话文件为空: {path}")
+        if args.fork is not None:
+            export_fork(entries, path, args.entry, os.path.expanduser(args.fork))
+            return
+    except (OSError, UnicodeError) as exc:
+        die(str(exc))
 
     if args.entry:
         chain, _ = active_branch(entries)

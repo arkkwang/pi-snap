@@ -2,7 +2,7 @@ English | [简体中文](README.zh-CN.md)
 
 # pi-snap
 
-Compact, read-only execution snapshots for humans and agents using official [Pi](https://github.com/earendil-works/pi). Find failures, inspect tool calls, and expand individual records without feeding an entire JSONL log into an agent's context. No running Pi instance or model requests required.
+Compact execution snapshots and session fork exports for humans and agents using official [Pi](https://github.com/earendil-works/pi). Find failures, inspect tool calls, expand individual records, and export an independent session at a selected entry. Source sessions are never modified. No running Pi instance or model requests required.
 
 ## Install and use
 
@@ -60,11 +60,27 @@ System summaries stay on one line: `cwd=… · Skills=13 · MCP=5 · Tools=6 · 
 
 Use snapshots to narrow the search and full records to verify evidence. Truncation and missing results prove neither success nor ongoing execution. Unsaved streaming progress cannot be recovered. `--json` currently applies to a single entry, not the entire session.
 
+## Fork a session
+
+```bash
+pi-snap <session-id> <entry-id> --fork ./retry.jsonl
+pi --session ./retry.jsonl
+```
+
+Select an entry ID from a snapshot (unique prefixes also work). The export follows `parentId` from the root **through the selected entry, inclusive**, even on a discarded branch. Siblings and later entries are excluded. To retry an assistant response, select the preceding user message or the last result of its preceding tool batch, not the response itself.
+
+The new header gets a fresh session ID, timestamp, and `parentSession` pointing to the source file. Other header fields and all selected records are preserved, including thinking, images, system records, model settings, compactions, and labels. No summaries are recomputed and no later information is imported. Change models/prompts and continue through your resume interface. Export does not restore files, processes, or external services, nor guarantee that a resume interface treats logged system records as its active system prompt.
+
+- Requires a v3 session, a non-existing destination file, and an existing parent directory. Success prints the absolute output path to stdout.
+- Cannot be combined with `--all`, `--tail`, or `--json`.
+- Malformed lines, duplicate IDs, broken/cyclic ancestry, invalid compaction references, and unpaired tool results fail export rather than silently losing or inventing records. Select a point before a tool batch or after all its results.
+- Only persisted records are exported. External attachment references remain the caller's responsibility.
+
 ## Limits and privacy
 
-- This is a log inspection tool, not a backup, recovery, or live-state service.
+- This is a log inspection and session fork tool, not an environment backup, rollback, or live-state service.
 - Opening a session reads the entire file; `--tail` limits display, not reading.
-- Invalid JSONL lines are skipped with a warning, including partially written trailing lines. The tool does not repair files.
+- Inspection skips invalid JSONL lines with a warning; fork export rejects them. The tool does not repair files.
 - Logs and output can contain prompts, paths, credentials, and tool results. Read-only does not mean redacted; do not publish private logs.
 - Targets official Pi session formats. Validated locally on Windows Git Bash; macOS/Linux have not yet been locally tested.
 
@@ -77,7 +93,9 @@ npm test
 bash test/snap.sh
 ```
 
-Tests use temporary synthetic sessions, covering branches, truncation, errors, ambiguous prefixes, duplicate IDs, paths with spaces, large inputs, and the npm launcher. No private sessions or model calls are used.
+Tests use temporary synthetic sessions, covering branches, truncation, errors, ambiguous prefixes, duplicate IDs, paths with spaces, large inputs, fork integrity, overwrite protection, and the npm launcher. No private sessions or model calls are used.
+
+Optional SDK contract test: set `PI_SNAP_SESSION_MANAGER` to your installed Pi's `dist/core/session-manager.js`, then run `npm test`. The real `SessionManager` opens exported sessions and verifies restored context equivalence at the selected entry. Without this variable, only CLI checks run; Pi is not installed automatically. Run `python3 test/benchmark.py` for a repeatable 20,000-entry benchmark (median of five warm runs).
 
 ## Related projects
 

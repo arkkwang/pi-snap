@@ -456,3 +456,4 @@ out="$(run "$system_file" sys1 --json)"
 grep -q 'sections' <<<"$out" || fail "system json: 原始分区缺失"
 printf 'PASS: system summary / sections / tool changes / string and block content / raw JSON\n'
 python3 "$root/test/summary.py"
+python3 "$root/test/fork.py"
