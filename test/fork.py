@@ -55,7 +55,9 @@ class ForkTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         exported = snap.load_entries(self.output)
         self.assertNotEqual(exported[0]["id"], "original")
-        self.assertEqual(exported[0]["parentSession"], str(self.source.resolve()))
+        # Export preserves the supplied absolute path, not a realpath. macOS /var
+        # aliases /private/var; resolving here would assert a different contract.
+        self.assertEqual(exported[0]["parentSession"], str(self.source.absolute()))
         self.assertEqual(exported[0]["cwd"], "/project")
         self.assertEqual(exported[1:], self.entries[1:6] + self.entries[7:9])
         self.assertEqual(self.source.read_bytes(), before)
