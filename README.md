@@ -2,7 +2,7 @@ English | [简体中文](README.zh-CN.md)
 
 # pi-snap
 
-Dialogue-first session browsing, execution snapshots, and session fork exports for humans and agents using official [Pi](https://github.com/earendil-works/pi). Understand requests and discussion first, then inspect tool calls, expand individual records, and export an independent session at a selected entry. Source sessions are never modified. No running Pi instance or model requests required.
+Session trajectories, execution summaries, and session fork exports for humans and agents using official [Pi](https://github.com/earendil-works/pi). Understand requests and discussion first, then inspect tool calls, expand individual records, and export an independent session at a selected entry. Source sessions are never modified. No running Pi instance or model requests required.
 
 ## Install and use
 
@@ -12,7 +12,7 @@ Requires Python 3.10+. npm installation also requires Node.js 22.19+ and does **
 npm install -g @arkkwang/pi-snap
 pi-snap --help
 pi-snap                              # Recent sessions
-pi-snap <session-id>                 # Full dialogue on the current branch
+pi-snap <session-id>                 # Full dialogue, tool parameters and status
 pi-snap <session-id> --trace          # Compact execution view
 pi-snap <session-id> --all            # Include discarded branches
 pi-snap <session-id> --tail 20        # Last 20 visible records in this view
@@ -32,9 +32,17 @@ bash /absolute/path/to/pi-snap/pi-snap <session-id>
 
 The default session root is `~/.pi/agent/sessions`. Use `--session-dir` for custom Pi data locations. Select a session by a header ID prefix, filename prefix, or JSONL path; ambiguous prefixes produce a diagnostic.
 
-The default view preserves complete user/assistant text and line breaks, with `[image]` placeholders for user images. Thinking, system messages, tool arguments and results are hidden. Between text messages, tool calls are grouped by name: `↳ 工具调用：bash × 3 · read × 2`. Counts come from saved toolCall blocks, not results; they do not prove execution or success. Calls inside Code Mode are not inferred from scripts or output. Aggregate lines have no invented entry IDs and do not count toward `--tail`.
+The default view is the session trajectory: full user/assistant text and line breaks, tool requests with key arguments capped at 100 characters (`TRAJECTORY_ARGS_MAX` in `snap.py`, overriding larger per-tool limits), and system/environment summaries. Tool results surface only on failure or unknown status, as a one-line status (`ERR`/`unknown`); successful executions are omitted entirely. Assistant responses that failed before producing content, and `context_edit` markers that remove records from the model context, are host-side recovery bookkeeping and stay out of the trajectory; `--trace` shows these execution events, while compaction and branch-summary boundaries remain visible. Thinking, image payloads and **all tool-result bodies** are omitted; user images keep an `[image]` placeholder. Unknown-tool arguments prioritize model/provider/cwd/task and omit common payload fields; this is summarization, not secret redaction. A saved request without a result does not prove execution or cancellation. Calls inside Code Mode are not inferred from scripts or output.
 
-`--trace` shows compact execution records, including calls, results, system summaries, compactions and interruption states. Full-record views reveal original content. Both views default to the branch ending at the last record; `--all` includes other branches and marks their records/tool counts with `~`.
+`compaction`, `branch_summary` and `context_edit` remain at their original positions without summary/replacement bodies. Actual tool messages saved inside `capability-prefetch` custom-message `details.prefetch.rounds[].messages` keep the original source ID, marked `[recommend]`; suggestions are never counted as execution.
+
+Preparation tools use their embedded execution timestamps (including epoch milliseconds), with a separate `[落盘 …]` persistence-time annotation. A batch with complete, consistent timing may move backwards along its own ancestor chain, within the same user/context interval, so delayed persistence does not make preparation appear to follow main execution. Ordinary entries are never globally time-sorted. Missing execution times are labelled unknown; conflicting or insufficient timing keeps the original position. `--all` preserves persistence order. Raw-ID ranges are selected before reordering in-window preparation, filtering and `--tail`; out-of-window records are not pulled in.
+
+`--trace` also shows `[discovery]` summaries of `capability-prefetch-diagnostic` entries: input settings, review gate reasons/counts, context delivery, outcomes and child session IDs. `configuredReview` and path-local `effectiveReview` are separate; missing fields in older logs do not establish the global switch. Diagnostics stay out of the default trajectory. Inspect full fields with the original ID and `--json`.
+
+`--trace` explicitly enables the existing compact execution summaries, including bounded result previews, shorter dialogue, failed responses and context-edit markers. Both views share one renderer; use `SESSION ENTRY` (or `--json`) for the original record. Both default to the branch ending at the file's last record; `--all` includes other branches with `~` marks. There is no global character cap or stdin mode: callers may use `--tail` and crop the returned text themselves without rebuilding trajectory semantics.
+
+**Integration requirement:** install a release with this new default before enabling callers that depend on result exclusion (bodies always; successful results entirely); 0.3.1 and earlier use the old dialogue-only default. A JSONL file must already reflect the active branch at the read boundary; pi-snap cannot see an in-memory-only branch cursor.
 
 ## Expand a discussion segment
 
@@ -45,12 +53,12 @@ pi-snap SESSION ENTRY
 pi-snap SESSION ENTRY --json
 ```
 
-- All views, ranges and details use original entry IDs, never renumbered. Unique prefixes work; missing, ambiguous or duplicate IDs fail explicitly.
+- Views, ranges and details use original entry IDs, including the parent custom-entry ID for embedded prefetch messages. Unique prefixes work; missing, ambiguous or duplicate IDs fail explicitly.
 - `--since ID1` includes its boundary; `--before ID2` excludes it. Either boundary is optional. Ordering follows the record chain, not timestamps or lexical ID order.
 - Bounds may refer to tool records or dialogue records. Off-branch or reversed bounds fail; identical bounds produce an explicitly empty range.
 - Ranges cannot be combined with `--all`, preventing silent cross-branch stitching.
-- Selection order: branch → range → view filter → `--tail N`. N must be positive. There is no implicit tail limit, including for ranges. Truncation reports omitted visible records; tool counts cover only the retained span.
-- Mixed assistant records keep their text and aggregate their tool calls. A trace record with multiple calls counts once toward `--tail`, not once per output line.
+- Selection order: branch → raw-ID range → in-window preparation projection → view filter → `--tail N`. N must be positive. There is no implicit tail limit, including for ranges. Tail omission reports the number of earlier visible records.
+- Mixed assistant records keep their text and tool calls together. A record with multiple calls counts once toward `--tail`, not once per output line; each expanded prefetch message counts separately.
 - Trace inventories and call/result pairing use the whole selected branch: a result outside the displayed window is not a missing result.
 
 ### Execution-view formatting
@@ -81,7 +89,7 @@ System summaries stay on one line: `cwd=… · Skills=13 · MCP=5 · Tools=6 · 
 3. Use the same IDs with `--trace --since ID1 --before ID2` to examine the relevant execution segment.
 4. Expand an individual entry ID; add `--json` for the original record structure.
 
-Assistant claims and tool counts are not success evidence. Use execution snapshots to narrow the search and full records to verify evidence. Truncation and missing results prove neither success nor ongoing execution. Unsaved streaming progress cannot be recovered. `--json` currently applies to a single entry, not the entire session.
+Assistant claims and tool requests are not success evidence. Use execution snapshots to narrow the search and full records to verify evidence. Truncation and missing results prove neither success nor ongoing execution. Unsaved streaming progress cannot be recovered. `--json` currently applies to a single entry, not the entire session.
 
 ## Fork a session
 

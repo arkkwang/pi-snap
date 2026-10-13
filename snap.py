@@ -8,7 +8,7 @@
 # 用法:
 #   pi-snap                          列出最近会话(按修改时间倒序，第二列是父目录/Run 名，
 #                                    第三列是完整头部 id)
-#   pi-snap <session-id 前缀>        对话脉络: 当前分支，正文完整，工具只计次数
+#   pi-snap <session-id 前缀>        会话轨迹: 当前分支，正文完整，工具参数与状态
 #                                    <session-id> 可以是会话头里的 id、文件名
 #                                    (<时间戳>_<uuid>.jsonl)前缀，或 jsonl 路径
 #   pi-snap <session> --trace        精简执行快照(含工具/结果/system/状态)
@@ -31,7 +31,9 @@
 #   assistant     正文截断 ~600 字符；thinking 丢弃
 #   工具调用      一行: [→ 工具名] + 关键参数(bash 只显示命令，read 只显示路径等)
 #   工具结果      一行: [← 工具名] ok/ERR + 大小 + 耗时 + 前 ~100 字符；read 成功不透内容
-#   异常状态      [status] 显示 aborted/error/length 和最后保存的内容类型；错误结果保留摘要。
+#   异常状态      [status] 仅 trace 显示 aborted/error/length；轨迹只对有内容/有调用的记录附加说明。
+#   结果          轨迹仅透出失败/未知状态一行；trace 含全部结果摘要。
+#   轨迹参数      工具调用参数截断到 TRAJECTORY_ARGS_MAX=100，各工具更大的 max_chars 被压过。
 # 未记录结果不等于正在执行或用户打断；JSONL 没落盘的流式进度无法恢复。
 #   system 消息   一行 cwd/Skills/MCP/Tools/Instructions 摘要；详情展开原文
 #   model_change 等元数据条目不显示(模型/会话名进头部)
@@ -50,6 +52,7 @@ from string import Formatter
 # ── 可调参数 ─────────────────────────────────────────────────────────────────
 USER_MAX, ASST_MAX = 800, 600     # user / assistant 正文截断
 ARGS_MAX, PEEK_MAX = 120, 100     # 默认工具调用参数 / 工具结果预览截断
+TRAJECTORY_ARGS_MAX = 100         # 轨迹视图工具参数硬上限：压过各工具更大的 max_chars
 # 工具输入摘要：max_chars 缺省用 ARGS_MAX；template 缺省展示整个参数 JSON。
 # 模板按参数名取值，缺失字段为空；:size 显示内容字符数，:count 显示条目数。
 # optional 片段仅在 when_any 中至少一个参数非 None 时追加；defaults 补缺失/None 字段。
@@ -136,6 +139,8 @@ def fmt_dur(ms):
 
 def parse_ts(iso):
     try:
+        if isinstance(iso, (int, float)) and not isinstance(iso, bool):
+            return datetime.fromtimestamp(iso / 1000, timezone.utc)
         return datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
     except Exception:
         return None
@@ -414,18 +419,29 @@ def dialogue_parts(entry):
             or (message.get("role") == "user" and part.get("type") == "image")]
 
 
-def trace_visible(entry):
-    if entry.get("type") == "compaction":
+def snapshot_visible(entry, trace=False):
+    if entry.get("type") == "custom" and entry.get("customType") == "capability-prefetch-diagnostic":
+        return trace
+    if entry.get("type") in ("compaction", "branch_summary"):
         return True
+    if entry.get("type") == "context_edit":
+        # 上下文摘除是宿主处理痕迹：轨迹不显示，执行摘要与单条展开可见。
+        return trace
     if entry.get("type") != "message":
         return False
     message = entry.get("message") or {}
     role = message.get("role")
-    if role in ("system", "toolResult") or dialogue_parts(entry):
+    if role == "toolResult":
+        # 轨迹只透出失败或状态未知的结果；执行摘要计入全部结果。
+        return trace or message.get("isError") is not False
+    if role == "system" or dialogue_parts(entry):
         return True
-    return role == "assistant" and (
-        message.get("stopReason") in ("aborted", "error", "length")
-        or any(p.get("type") == "toolCall" for p in message_parts(message)))
+    if role != "assistant":
+        return False
+    if any(p.get("type") == "toolCall" for p in message_parts(message)):
+        return True
+    # 无正文也无调用：失败/中断记录属执行细节，只进执行摘要。
+    return trace and message.get("stopReason") in ("aborted", "error", "length")
 
 
 def select_range(entries, seq, since, before):
@@ -455,8 +471,10 @@ def render_snapshot(entries, path, show_all, tail, sessions_dir=None, selector=N
     branch_seq = [e for e in (entries if show_all else chain) if isinstance(e, dict)]
     if show_all and (since is not None or before is not None):
         die("区间查询不能与 --all 混用；请使用当前分支的记录 ID")
-    seq = select_range(entries, branch_seq, since, before)
-    visible = trace_visible if trace else dialogue_parts
+    seq = list(trajectory_records(select_range(entries, branch_seq, since, before), reorder=not show_all))
+    # Inventory inheritance always follows the original parent chain.
+    branch_seq = list(trajectory_records(branch_seq, reorder=False))
+    visible = lambda e: snapshot_visible(e, trace)
     visible_indices = [i for i, entry in enumerate(seq) if visible(entry)]
     total_visible = len(visible_indices)
     omitted = max(0, total_visible - tail) if tail is not None else 0
@@ -504,7 +522,7 @@ def render_snapshot(entries, path, show_all, tail, sessions_dir=None, selector=N
                   and e.get("type") in ("message", "compaction")]
     meta.append(f"{len(chain)}/{len(entries)} 条记录在当前分支" if off_branch
                 else f"{len(chain)} 条记录")
-    view = "执行" if trace else "对话"
+    view = "执行摘要" if trace else "轨迹"
     meta.append(f"{view}显示 {total_visible - omitted}/{total_visible} 条")
     if omitted:
         meta.append(f"省略前 {omitted} 条 (--tail {tail})")
@@ -517,88 +535,80 @@ def render_snapshot(entries, path, show_all, tail, sessions_dir=None, selector=N
     # is not a missing result, and tool inventories inherit earlier system entries.
     pending, result_ids = {}, set()
     tool_states, system_summaries = {}, {}
-    if trace:
-        for entry in branch_seq:
-            message = entry.get("message") or {}
-            tools = tool_states.get(entry.get("parentId"))
-            if message.get("role") == "system":
-                initial = tools is None and "toolsAdded" in message and not message.get("toolsRemoved")
-                if "toolsAdded" in message or "toolsRemoved" in message:
-                    if tools is not None or "toolsAdded" in message:
-                        tools = set(tools or ())
-                        tools.difference_update(message.get("toolsRemoved") or [])
-                        tools.update(t["name"] for t in message.get("toolsAdded") or [])
-                        tools = frozenset(tools)
-                system_summaries[entry.get("id")] = system_summary(message, tools, initial)
-            tool_states[entry.get("id")] = tools
-            if message.get("role") == "assistant":
-                for part in message_parts(message):
-                    if part.get("type") == "toolCall" and part.get("id"):
-                        pending[part["id"]] = parse_ts(entry.get("timestamp"))
-            elif message.get("role") == "toolResult":
-                result_ids.add(message.get("toolCallId"))
+    for entry in branch_seq:
+        message = entry.get("message") or {}
+        tools = tool_states.get(entry.get("parentId"))
+        if message.get("role") == "system":
+            initial = tools is None and "toolsAdded" in message and not message.get("toolsRemoved")
+            if "toolsAdded" in message or "toolsRemoved" in message:
+                if tools is not None or "toolsAdded" in message:
+                    tools = set(tools or ())
+                    # Pi persists removals as full tool objects, not bare names.
+                    tools.difference_update(
+                        t["name"] if isinstance(t, dict) else t
+                        for t in message.get("toolsRemoved") or [])
+                    tools.update(t["name"] for t in message.get("toolsAdded") or [])
+                    tools = frozenset(tools)
+            system_summaries[entry.get("id")] = system_summary(message, tools, initial)
+        tool_states[entry.get("id")] = tools
+        if message.get("role") == "assistant":
+            for part in message_parts(message):
+                if part.get("type") == "toolCall" and part.get("id"):
+                    pending[part["id"]] = parse_ts(entry.get("timestamp"))
+        elif message.get("role") == "toolResult":
+            result_ids.add(message.get("toolCallId"))
 
     if not trace:
-        print(dim("脉络视图：工具仅计调用次数；参数、结果及状态用 --trace 查看。"))
+        print(dim("轨迹视图：对话正文完整；工具显示请求参数，失败或未知结果透出一行状态；未产生内容的失败响应、上下文摘除与结果摘要用 --trace，原文用单条详情。"))
+    if any(e.get("_host_position") is not None for e in seq):
+        print(dim("预取按已记录的执行时间展示，另注父记录落盘时间；仅在同一分支、同一用户/上下文区间且时间完整一致时前移。--all 保留落盘顺序；ID 区间仍按原记录链。"))
     if not total_visible:
         print(dim("当前视图无可显示记录。"))
-    tool_counts = {}
-
-    def flush_tools():
-        if tool_counts:
-            print(dim("       ↳ 工具调用：" + " · ".join(
-                f"{name} × {count}" for name, count in tool_counts.items())))
-            tool_counts.clear()
-
     first = True
     for e in seq:
         if not isinstance(e, dict):
             continue
         mark = "" if e.get("id") in on_branch else "~"
-        if not trace:
-            parts = dialogue_parts(e)
-            if parts:
-                flush_tools()
-                if not first:
-                    print()
-                role = e["message"]["role"]
-                head = f"{mark}[{e.get('id', '?')}]"
-                tstr = fmt_time(e.get("timestamp", ""), ref_date)
-                if tstr:
-                    head += f" [{tstr}]"
-                color = green if role == "user" else blue
-                body = "\n".join(str(p.get("text", "")) if p.get("type") == "text"
-                                 else "[image]" for p in parts)
-                print(f"{dim(head)} {color('[' + role + ']')}  {body}")
-                first = False
-            message = e.get("message") or {}
-            if message.get("role") == "assistant":
-                for part in message_parts(message):
-                    if part.get("type") == "toolCall":
-                        name = mark + str(part.get("name", "?"))
-                        tool_counts[name] = tool_counts.get(name, 0) + 1
-            continue
         if not mark and not first and e.get("type") == "message" \
                 and (e.get("message") or {}).get("role") == "user":
             print()  # 轮与轮之间空一行
-        if e.get("type") == "compaction":
+        if e.get("type") == "context_edit" and not trace:
+            continue  # 上下文摘除属执行细节，轨迹视图不显示
+        if e.get("type") in ("compaction", "context_edit", "branch_summary"):
             tstr = fmt_time(e.get("timestamp", ""), ref_date)
             chead = f"{mark}{dim('[' + str(e.get('id', '?')) + ']')}"
             if tstr:
                 chead += " " + dim(f"[{tstr}]")
-            print(f"{chead} {yellow('[✦ compact]')}"
-                  + (f"  {trunc(e.get('summary', ''), SUMMARY_MAX)}" if e.get("summary") else ""))
+            kind = e.get("type")
+            label = "✦ compact" if kind == "compaction" else kind
+            if kind == "context_edit":
+                action = "removed" if e.get("replacement") is None else "replaced"
+                detail = f"target={e.get('targetId', '?')} {action}; prior content may no longer be visible"
+            else:
+                detail = (trunc(e.get("summary", ""), SUMMARY_MAX) if trace else
+                          f"summary omitted ({len(e.get('summary') or '')} chars)")
+            print(f"{chead} {yellow('[' + label + ']')}  {detail}")
             first = False
+            continue
+        if e.get("type") == "custom" and e.get("customType") == "capability-prefetch-diagnostic":
+            if trace:
+                stamp = fmt_time(e.get("timestamp"), ref_date)
+                head = f"{mark}[{e.get('id', '?')}]" + (f" [{stamp}]" if stamp else "")
+                print(f"{head} [discovery] {diagnostic_summary(e.get('data') or {})}")
+                first = False
             continue
         if e.get("type") != "message":
             continue
         lines = render_message(e, mark, ref_date, pending, result_ids,
-                               system_summaries.get(e.get("id")))
+                               system_summaries.get(e.get("id")), trace=trace)
         if lines:
+            if e.get("_host_position") is not None:
+                persisted = fmt_time(e.get("_persisted_at"), ref_date) or "未知"
+                note = "执行时间未知；" if not parse_ts(e.get("timestamp")) else ""
+                lines = [line + dim(f" [{note}落盘 {persisted}]") for line in lines]
             print("\n".join(lines))
             first = False
 
-    flush_tools()
     print()
     hints = []
     if off_branch:
@@ -607,7 +617,7 @@ def render_snapshot(entries, path, show_all, tail, sessions_dir=None, selector=N
                  + copy_prefix(sessions_dir) + shlex.quote(selector or sid) + " <entry-id>")
     print(dim("─" * 8 + " " + " · ".join(hints)))
 
-def render_message(e, mark, ref_date, pending, result_ids, system_text=None):
+def render_message(e, mark, ref_date, pending, result_ids, system_text=None, trace=True):
     """单条 message 渲染成若干行；每行统一 [id] [time] [type] 内容。
     工具调用不是独立记录，沿用所属 assistant 条目的 id/时间；
     纯工具调用的条目不输出 [assistant] 行(它只表示 Agent 说的话)。"""
@@ -619,6 +629,8 @@ def render_message(e, mark, ref_date, pending, result_ids, system_text=None):
     head = f"{mark}{dim('[' + str(eid) + ']')}"
     if tstr:
         head += " " + dim(f"[{tstr}]")
+    if e.get("_host_position") is not None:
+        head += " " + dim("[recommend]")
 
     if role == "system":
         return [f"{head} {yellow('[system]')}  "
@@ -628,7 +640,8 @@ def render_message(e, mark, ref_date, pending, result_ids, system_text=None):
         out = []
         for p in message_parts(m):
             if p.get("type") == "text" and str(p.get("text", "")).strip():
-                out.append(f"{head} {green('[user]')}  {trunc(p.get('text', ''), USER_MAX)}")
+                body = trunc(p.get('text', ''), USER_MAX) if trace else p.get('text', '')
+                out.append(f"{head} {green('[user]')}  {body}")
             elif p.get("type") == "image":
                 out.append(f"{head} {green('[user]')}  [image]")
         return out or None
@@ -639,17 +652,21 @@ def render_message(e, mark, ref_date, pending, result_ids, system_text=None):
         for p in message_parts(m):
             pt = p.get("type")
             if pt == "text" and str(p.get("text", "")).strip():
-                out.append(f"{head} {blue('[assistant]')}  {trunc(p.get('text', ''), ASST_MAX)}")
+                body = trunc(p.get('text', ''), ASST_MAX) if trace else p.get('text', '')
+                out.append(f"{head} {blue('[assistant]')}  {body}")
             elif pt == "toolCall":
                 config = TOOL_SUMMARIES.get(p.get("name"), {})
-                args_s = trunc(fmt_call_args(p.get("name"), p.get("arguments")),
-                               config.get("max_chars", ARGS_MAX), config.get("truncate", "head"))
+                args_s = (trunc(fmt_call_args(p.get("name"), p.get("arguments")),
+                                config.get("max_chars", ARGS_MAX), config.get("truncate", "head")) if trace else
+                          trajectory_call_args(p.get("name"), p.get("arguments")))
                 note = ""
                 if p.get("id") not in result_ids:
                     note = " [未记录结果；是否开始执行未知]"
                     if reason in ("aborted", "error", "length"):
                         note = " [响应未完成，参数可能不完整；未记录结果]"
                 out.append(f"{head} {cyan('[→ ' + p.get('name', '?') + ']')}  {dim(args_s)}{yellow(note)}")
+        if not out and not trace:
+            return None  # 无正文也无调用：失败/中断记录轨迹不显示，仅执行摘要可见
         if reason in ("aborted", "error", "length"):
             label = {"aborted": "响应已中断（取消来源未知）",
                      "error": "响应失败", "length": "响应达到长度限制"}[reason]
@@ -668,6 +685,11 @@ def render_message(e, mark, ref_date, pending, result_ids, system_text=None):
 
     if role == "toolResult":
         name = m.get("toolName", "?")
+        if not trace:
+            if m.get("isError") is False:
+                return None  # 成功执行整条不显示；详情走 --trace 或单条展开
+            status = "ERR" if m.get("isError") is True else "unknown"
+            return [f"{head} {yellow('[← ' + name + ']')} {status}"]
         text = "".join(p.get("text", "") for p in (message_parts(m))
                        if p.get("type") == "text")
         nimg = sum(1 for p in (message_parts(m)) if p.get("type") == "image")
@@ -692,6 +714,115 @@ def render_message(e, mark, ref_date, pending, result_ids, system_text=None):
         return [line]
 
     return None
+
+# Default trajectory shares message rendering with the explicit --trace view.
+# Consumers must not reimplement tool/event semantics.
+def trajectory_call_args(name, args):
+    if name in TOOL_SUMMARIES:
+        config = TOOL_SUMMARIES[name]
+        return trunc(fmt_call_args(name, args),
+                     min(config.get("max_chars", ARGS_MAX), TRAJECTORY_ARGS_MAX),
+                     config.get("truncate", "head"))
+
+    def compact(value, depth=0):
+        if isinstance(value, dict):
+            priority = ("model", "provider", "cwd", "task", "command", "path")
+            keys = [k for k in priority if k in value]
+            keys += [k for k in value if k not in priority]
+            out = {}
+            for key in keys[:16]:
+                if key.lower() in {"content", "base64", "data", "image", "images", "payload",
+                                   "oldtext", "newtext", "thinking"}:
+                    out[key] = "[payload omitted]"
+                else:
+                    out[key] = compact(value[key], depth + 1) if depth < 3 else "[…]"
+            if len(keys) > 16:
+                out["…"] = "keys omitted"
+            return out
+        if isinstance(value, list):
+            return ([compact(item, depth + 1) for item in value[:4]]
+                    + (["[… items omitted]"] if len(value) > 4 else [])) if depth < 3 else "[…]"
+        return trunc(value, 180) if isinstance(value, str) else value
+
+    return trunc(fmt_call_args(name, compact(args)), TRAJECTORY_ARGS_MAX)
+
+
+def diagnostic_summary(data):
+    """Small allowlisted index, not a dump of prompts, raw errors or tool outputs."""
+    bits = [str(data.get("trigger", "?")), str(data.get("event", "?"))]
+    for key in ("reason", "preparation", "delivery", "outcome", "warningCount", "resetFromSteps", "requests"):
+        if key in data:
+            bits.append(f"{key}={trunc(str(data[key]), 80)}")
+    if "steps" in data:
+        bits.append(f"steps={data['steps']}/{data.get('interval', '?')}")
+    for key, label in (("configuredOptions", "configuredReview"), ("effectiveOptions", "effectiveReview")):
+        options = data.get(key) or {}
+        if "trajectoryWarnings" in options:
+            bits.append(f"{label}={str(options['trajectoryWarnings']).lower()}")
+    if (data.get("childSession") or {}).get("id"):
+        bits.append(f"child={data['childSession']['id']}")
+    return " · ".join(bits)
+
+
+def trajectory_records(entries, reorder=True):
+    """Project actual preparation tools, retaining source IDs and persistence time.
+    Ordinary records never reorder. Move a complete, consistently timed batch only
+    backwards along its own ancestry, with a known lower time bound. Never cross a
+    user/context boundary or the selected raw-ID window. No cross-branch --all sort.
+    """
+    entries = list(entries)
+    by_id = {e.get("id"): i for i, e in enumerate(entries)}
+    buckets = [[] for _ in entries]
+    barriers = {"compaction", "context_edit", "branch_summary"}
+    for index, entry in enumerate(entries):
+        message = entry.get("message") or (entry if entry.get("type") == "custom_message" else {})
+        if message.get("customType") != "capability-prefetch":
+            buckets[index].append(entry)
+            continue
+        projected = []
+        for ri, round_ in enumerate(((message.get("details") or {}).get("prefetch") or {}).get("rounds") or []):
+            for mi, item in enumerate(round_.get("messages") or []):
+                if item.get("role") not in ("assistant", "toolResult"):
+                    continue
+                if item.get("role") == "assistant":
+                    item = dict(item, content=[p for p in message_parts(item) if p.get("type") == "toolCall"])
+                projected.append(dict(type="message", id=entry.get("id"), _host_position=f"{ri}/{mi}",
+                                      parentId=entry.get("parentId"), timestamp=item.get("timestamp"),
+                                      _persisted_at=entry.get("timestamp"), message=item))
+        times = [parse_ts(e.get("timestamp")) for e in projected]
+        persisted = parse_ts(entry.get("timestamp"))
+        target = index
+        if reorder and times and all(times) and persisted:
+            stamps = [t.timestamp() for t in times]
+            if stamps == sorted(stamps) and stamps[-1] <= persisted.timestamp():
+                cursor, candidate = entry.get("parentId"), index
+                seen = set()
+                while cursor in by_id and cursor not in seen:
+                    seen.add(cursor)
+                    pos = by_id[cursor]
+                    if pos >= index:
+                        break
+                    ancestor = entries[pos]
+                    when = parse_ts(ancestor.get("timestamp"))
+                    if when and when.timestamp() <= stamps[0]:
+                        target = candidate
+                        break
+                    ancestor_message = ancestor.get("message") or ancestor
+                    boundary = (ancestor.get("type") in barriers
+                                or ancestor_message.get("role") in ("user", "system")
+                                or ancestor_message.get("customType") == "capability-prefetch")
+                    if boundary or not when or when.timestamp() < stamps[-1]:
+                        break
+                    candidate, cursor = pos, ancestor.get("parentId")
+        # Insert ahead of the anchor's ordinary entry, not after it.
+        if target < index:
+            buckets[target][0:0] = projected
+        else:
+            buckets[index].extend(projected)
+    for bucket in buckets:
+        yield from bucket
+
+
 
 # ── 列表模式 ─────────────────────────────────────────────────────────────────
 def peek_head(path, max_lines=60, preview=True):
@@ -842,12 +973,12 @@ def render_entry_full(e, on_branch, as_json):
 def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="pi-snap",
-        description="Pi Agent 会话脉络、执行快照与分叉导出。默认显示完整对话与工具次数；--trace 展开执行摘要。"
+        description="Pi Agent 会话轨迹、执行摘要与分叉导出。默认显示完整对话、工具参数和状态；--trace 展开结果摘要。"
                     "未记录结果不等于正在执行或用户打断，未落盘的流式进度不可恢复。",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="示例:\n"
                "  pi-snap                          # 列出最近会话\n"
-               "  pi-snap 01a0e2d6                 # 对话脉络(正文完整)\n"
+               "  pi-snap 01a0e2d6                 # 会话轨迹(正文完整)\n"
                "  pi-snap 01a0e2d6 --trace --since ID1 --before ID2\n"
                "                                   # 展开一段执行过程 [ID1, ID2)\n"
                "  pi-snap 01a0e2d6 --all           # 含被回退丢弃的记录\n"
@@ -864,7 +995,7 @@ def main(argv=None):
     ap.add_argument("--trace", action="store_true", help="执行视图：包含工具调用、结果、system 与状态摘要")
     ap.add_argument("--since", metavar="ID", help="从当前分支记录 ID（或唯一前缀）开始，包含该记录")
     ap.add_argument("--before", metavar="ID", help="在当前分支记录 ID（或唯一前缀）之前结束，不含该记录")
-    ap.add_argument("--tail", type=int, metavar="N", help="过滤后最后 N 条可显示记录（正整数）；工具计数摘要不占条数")
+    ap.add_argument("--tail", type=int, metavar="N", help="过滤后最后 N 条可显示记录（正整数）；同条中的多个工具调用占一条")
     ap.add_argument("--json", action="store_true", help="配合 entry: 输出原始 JSON")
     ap.add_argument("--fork", metavar="PATH", help="导出截至 entry(含)的独立 v3 会话；目标必须不存在，不恢复环境")
     args = ap.parse_args(argv)

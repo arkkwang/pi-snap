@@ -1,4 +1,4 @@
-"""Dialogue-first navigation and stable-ID execution ranges (no private logs)."""
+"""Default trajectory navigation and stable-ID execution ranges (no private logs)."""
 import contextlib
 import io
 import json
@@ -67,47 +67,76 @@ class DialogueTest(unittest.TestCase):
         self.assertIn('[asst001]', out)
         self.assertIn('Explain\nthen act', out)
         self.assertIn('Follow-up string', out)
-        for hidden in ('[→', '[←', '[system]', '[status]', 'HIDDEN', 'RESULT BODY', 'OLD BRANCH', '[asst002]'):
+        for hidden in ('[status]', 'HIDDEN', 'RESULT BODY', 'BASH RESULT', 'OLD BRANCH'):
             self.assertNotIn(hidden, out)
         self.assertIn('--trace', out)
         self.assertIn('[asst001]', self.ok('--trace'))
         self.assertEqual(json.loads(self.ok('asst001', '--json')), self.rows[3])
 
-    def test_tool_counts_are_grouped_between_texts_and_not_results(self):
+    def test_calls_and_status_are_in_order_without_result_bodies(self):
         out = self.ok()
-        self.assertEqual(out.count('read × 1'), 1)
-        self.assertEqual(out.count('bash × 1'), 1)
-        self.assertNotIn('read × 2', out)
-        self.assertLess(out.index('Explain\nthen act'), out.index('read × 1'))
-        self.assertLess(out.index('read × 1'), out.index('Follow-up string'))
-        self.assertLess(out.index('bash × 1'), out.index('Final answer'))
-        self.assertNotIn('↳ 工具调用', self.ok('--trace'))
-        self.assertNotIn('bash ×', self.ok('--tail', '1'))
+        self.assertEqual(out.count('[→ read]'), 1)
+        self.assertEqual(out.count('[→ bash]'), 1)
+        self.assertIn('[← read]', out)
+        self.assertIn('[system]', out)
+        self.assertLess(out.index('Explain\nthen act'), out.index('[→ read]'))
+        self.assertLess(out.index('[→ read]'), out.index('Follow-up string'))
+        self.assertLess(out.index('[→ bash]'), out.index('Final answer'))
+        self.assertNotIn('↳ 工具调用', out)
         ranged = self.ok('--since', 'asst002', '--before', 'asst003')
-        self.assertIn('bash × 1', ranged)
-        self.assertNotIn('read ×', ranged)
+        self.assertIn('[→ bash]', ranged)
+        self.assertNotIn('[→ read]', ranged)
 
-    def test_multiple_calls_in_one_entry_count_individually(self):
+    def test_failed_results_surface_and_successful_results_stay_hidden(self):
+        self.rows[4]['message']['isError'] = True   # res001 失败
+        self.rows[8]['message']['isError'] = False  # res002 成功
+        self.save()
+        out = self.ok()
+        self.assertIn('[← read]', out)
+        self.assertIn('[← read] ERR', out)
+        self.assertNotIn('[← bash]', out)
+        self.assertIn('[← bash] ok', self.ok('--trace'))
+        tail = self.ok('--tail', '3')
+        self.assertIn('[asst003]', tail)
+        self.assertNotIn('[res002]', tail)
+        self.assertIn('省略前 5 条', tail)  # 可见 8 条：成功结果不计入
+
+    def test_host_bookkeeping_stays_out_of_trajectory(self):
+        self.rows.append(msg('fail1', 'compact', 'assistant', [],
+                             stopReason='error', errorMessage='fetch failed'))
+        self.rows.append(dict(type='context_edit', id='ctx1', parentId='fail1',
+                              targetId='fail1', replacement=None))
+        self.save()
+        out = self.ok()
+        self.assertNotIn('[fail1]', out)
+        self.assertNotIn('[ctx1]', out)
+        self.assertNotIn('fetch failed', out)
+        trace = self.ok('--trace')
+        self.assertIn('响应失败', trace)
+        self.assertIn('fetch failed', trace)
+        self.assertIn('[ctx1]', trace)
+        self.assertIn('fetch failed', self.ok('fail1'))  # 单条展开仍可查
+        self.assertIn('context_edit', self.ok('ctx1'))
+
+    def test_multiple_calls_in_one_entry_share_id_and_tail_count(self):
         self.rows[3]['message']['content'].extend([
             dict(type='toolCall', id='tc-extra', name='read', arguments={}),
             dict(type='toolCall', id='tc-edit', name='edit', arguments={}),
         ])
         self.save()
-        out = self.ok('--before', 'user002')
-        self.assertIn('read × 2 · edit × 1', out)
-        self.assertEqual(out.count('↳ 工具调用'), 1)
-        self.assertNotIn('bash ×', out)
+        out = self.ok('--before', 'res001', '--tail', '1')
+        self.assertEqual(out.count('[→ read]'), 2)
+        self.assertEqual(out.count('[→ edit]'), 1)
+        self.assertNotIn('[user001]', out)
+        self.assertNotIn('[→ bash]', out)
 
-    def test_tail_counts_visible_entries_not_tool_rows_or_metadata(self):
-        out = self.ok('--tail', '2')
-        self.assertIn('[user002]', out)
-        self.assertIn('[asst003]', out)
-        self.assertNotIn('[asst001]', out)
-        self.assertIn('省略前 2 条', out)
-        trace = self.ok('--trace', '--tail', '2')
-        self.assertIn('[asst003]', trace)
-        self.assertIn('[compact]', trace)
-        self.assertNotIn('[res002]', trace)
+    def test_tail_counts_visible_entries_including_tools_and_events(self):
+        for args in [('--tail', '2'), ('--trace', '--tail', '2')]:
+            out = self.ok(*args)
+            self.assertIn('[asst003]', out)
+            self.assertIn('[compact]', out)
+            self.assertNotIn('[res002]', out)
+            self.assertIn('省略前 7 条', out)
 
     def test_range_inclusive_since_exclusive_before_and_prefix(self):
         out = self.ok('--trace', '--since', 'user001', '--before', 'user002')
@@ -120,7 +149,7 @@ class DialogueTest(unittest.TestCase):
         self.assertNotIn('未记录结果', out)
         out = self.ok('--since', 'res001', '--before', 'asst002')
         self.assertIn('[user002]', out)
-        self.assertNotIn('[res001]', out)
+        self.assertIn('[res001]', out)
         self.assertNotIn('[asst003]', out)
         self.assertIn('[compact]', self.ok('--trace', '--since', 'compact'))
         self.assertNotIn('[user002]', self.ok('--before', 'user002'))
@@ -143,7 +172,7 @@ class DialogueTest(unittest.TestCase):
     def test_all_keeps_original_branch_marks(self):
         out = self.ok('--all')
         self.assertIn('~[old001]', out)
-        self.assertNotIn('[←', out)
+        self.assertIn('[←', out)
         self.assertIn('~[old001]', self.ok('--all', '--trace'))
 
     def test_bad_bounds_and_conflicting_modes(self):
@@ -159,7 +188,7 @@ class DialogueTest(unittest.TestCase):
 
     def test_empty_range_and_empty_dialogue_are_explicit(self):
         self.assertIn('无可显示记录', self.ok('--since', 'user001', '--before', 'user001'))
-        self.assertIn('无可显示记录', self.ok('--since', 'asst002', '--before', 'asst003'))
+        self.assertIn('[→ bash]', self.ok('--since', 'asst002', '--before', 'asst003'))
 
     def test_duplicate_exact_id_rejected(self):
         self.rows.append(dict(self.rows[2], parentId='compact'))
@@ -167,12 +196,13 @@ class DialogueTest(unittest.TestCase):
         self.assertNotEqual(self.run_cli('user001')[0], 0)
         self.assertNotEqual(self.run_cli('--since', 'user001')[0], 0)
 
-    def test_image_only_user_preserves_turn_placeholder(self):
+    def test_image_only_user_keeps_placeholder_without_payload(self):
         self.rows.append(msg('image001', 'compact', 'user', [dict(type='image', data='HIDDEN IMAGE')]))
         self.save()
         out = self.ok('--tail', '1')
         self.assertIn('[image001]', out)
         self.assertIn('[image]', out)
+        self.assertIn('[image]', self.ok('--trace', '--tail', '1'))
         self.assertNotIn('HIDDEN IMAGE', out)
 
 

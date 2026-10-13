@@ -145,6 +145,8 @@ a = entry('a', 's1', role='assistant', content=[])
 s2 = entry('s2', 'a', role='system', toolsAdded=[{'name': 'edit'}], toolsRemoved=['read'])
 s3 = entry('s3', 'a', role='system', toolsAdded=[{'name': 'write'}])
 s4 = entry('s4', 's3', role='system', toolsRemoved=['bash'])
+# Real Pi sessions persist removals as full tool objects, not bare names.
+s5 = entry('s5', 's4', role='system', toolsRemoved=[{'name': 'write', 'description': 'write files'}])
 
 
 def snapshot(entries, all=False, tail=None):
@@ -154,16 +156,17 @@ def snapshot(entries, all=False, tail=None):
     return out.getvalue()
 
 
-entries = [s1, a, s2, s3, s4]
+entries = [s1, a, s2, s3, s4, s5]
 out = snapshot(entries, all=True)
 assert 'cwd=/path with spaces/项目 · Skills=2 · MCP=2 · Tools=2 · Instructions=1' in out
 assert 'SECRET' not in out
 assert '~[s2] [system]  Tools=2(+1/-1)' in out
 assert '[s3] [system]  Tools=3(+1)' in out
 assert '[s4] [system]  Tools=2(-1)' in out
-assert len([line for line in out.splitlines() if '[system]' in line]) == 4
+assert '[s5] [system]  Tools=1(-1)' in out
+assert len([line for line in out.splitlines() if '[system]' in line]) == 5
 out = snapshot(entries, tail=1)
-assert '[s1]' not in out and '[s4] [system]  Tools=2(-1)' in out
+assert '[s1]' not in out and '[s5] [system]  Tools=1(-1)' in out
 assert '~[s2]' not in snapshot(entries)
 assert 'Tools=?(-1)' in render(entry('unknown', role='system', toolsRemoved=['bash']))
 assert 'sections=custom' in render(entry('custom', role='system', sections={'custom': 'SECRET'}))
