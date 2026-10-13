@@ -1,84 +1,34 @@
 #!/usr/bin/env python3
-# pi-snap — Pi Agent 会话执行快照与分叉导出（不修改原会话，不依赖 pi 运行时）。
-#
-# 会话记录: ~/.pi/agent/sessions/<cwd 目录名>/<时间戳>_<uuid>.jsonl
-# 每行一个 JSON 对象(记录)，id/parentId 构成一棵树；回退(rewind)后继续是往树上
-# 追加新分支，"当前分支" = 从文件最后一条记录沿 parentId 走回根。
-#
-# 用法:
-#   pi-snap                          列出最近会话(按修改时间倒序，第二列是父目录/Run 名，
-#                                    第三列是完整头部 id)
-#   pi-snap <session-id 前缀>        会话轨迹: 当前分支，正文完整，工具参数与状态
-#                                    <session-id> 可以是会话头里的 id、文件名
-#                                    (<时间戳>_<uuid>.jsonl)前缀，或 jsonl 路径
-#   pi-snap <session> --trace        精简执行快照(含工具/结果/system/状态)
-#   pi-snap <session> --since ID1 --before ID2  当前分支区间 [ID1, ID2)
-#   pi-snap <session> --all          连被回退丢弃的记录一起看(~ 前缀标记)
-#   pi-snap <session> --tail N       只看当前视图最后 N 条可显示记录(过滤后截取)
-#   pi-snap <session> <entry-id>     查看某条记录的完整内容(快照中被截断的原文)
-#   pi-snap <session> <entry-id> --json   该条记录的原始 JSON
-#   pi-snap <session> <entry-id> --fork out.jsonl  导出含截止点的独立会话
-#   pi-snap --session-dir <path> ... 指定会话根目录(递归查找其下 .jsonl；测试时
-#                                    session 不在 ~/.pi 下；也可直接传 jsonl
-#                                    文件路径作为 session 参数)
-#
-# 每行统一 [id] [time] [type] 内容。type: [user] / [assistant](Agent 说的话，
-# 没有就不出现) / [→ 工具名](调用，沿用所属 assistant 条目的 id/时间) /
-# [← 工具名](结果，独立记录) / [✦ compact]。
-#
-# 默认对话正文不截断；以下精简规则仅用于 --trace:
-#   user 消息     正文截断 ~800 字符，换行折叠
-#   assistant     正文截断 ~600 字符；thinking 丢弃
-#   工具调用      一行: [→ 工具名] + 关键参数(bash 只显示命令，read 只显示路径等)
-#   工具结果      一行: [← 工具名] ok/ERR + 大小 + 耗时 + 前 ~100 字符；read 成功不透内容
-#   异常状态      [status] 仅 trace 显示 aborted/error/length；轨迹只对有内容/有调用的记录附加说明。
-#   结果          轨迹仅透出失败/未知状态一行；trace 含全部结果摘要。
-#   轨迹参数      工具调用参数截断到 TRAJECTORY_ARGS_MAX=100，各工具更大的 max_chars 被压过。
-# 未记录结果不等于正在执行或用户打断；JSONL 没落盘的流式进度无法恢复。
-#   system 消息   一行 cwd/Skills/MCP/Tools/Instructions 摘要；详情展开原文
-#   model_change 等元数据条目不显示(模型/会话名进头部)
-#
+# pi-snap — 通用 Pi 会话记录读取、筛选、展示与分叉导出。
+# JSON 结构是展示底座；未知字段不需要注册，预设只是筛选和长度配置。
+# 分支按文件最后一条记录的 parentId 链选择，不推断运行时游标或执行状态。
+# 已知 Pi 时间语义单独适配；预取的执行时间与落盘时间不混用。
 import argparse
 import glob
 import json
 import os
-import re
 import shlex
 import sys
 from datetime import datetime, timezone
 from uuid import uuid4
-from string import Formatter
 
-# ── 可调参数 ─────────────────────────────────────────────────────────────────
-USER_MAX, ASST_MAX = 800, 600     # user / assistant 正文截断
-ARGS_MAX, PEEK_MAX = 120, 100     # 默认工具调用参数 / 工具结果预览截断
-TRAJECTORY_ARGS_MAX = 100         # 轨迹视图工具参数硬上限：压过各工具更大的 max_chars
-# 工具输入摘要：max_chars 缺省用 ARGS_MAX；template 缺省展示整个参数 JSON。
-# 模板按参数名取值，缺失字段为空；:size 显示内容字符数，:count 显示条目数。
-# optional 片段仅在 when_any 中至少一个参数非 None 时追加；defaults 补缺失/None 字段。
-# truncate="middle" 保留前 1/3 和后 2/3；默认保留开头，不解析路径。
-# result 可覆盖结果模板、成功/错误预览长度；未配置的沿用下方默认值。
-RESULT_TEMPLATE = "{status} {size}{duration}"  # duration 有值时自带前导空格
-TOOL_SUMMARIES = {
-    "bash": {"max_chars": 600, "template": "{command}"},
-    "read": {
-        "template": "{path}",
-        "truncate": "middle",
-        "optional": [{
-            "when_any": ("offset", "limit"),
-            "template": " @{offset!s}+{limit!s}",
-            "defaults": {"offset": "?", "limit": "?"},
-        }],
-        "result": {"template": "{status} {lines} lines {size}", "preview_chars": 0},
-    },
-    "ls": {"template": "{path}", "truncate": "middle"},
-    "write": {"template": "{path} · {content:size}", "truncate": "middle"},
-    "edit": {"template": "{path} · {edits:count} 处修改", "truncate": "middle"},
-    "grep": {"template": "{pattern} · {path}"},
-    "find": {"template": "{pattern} · {path}"},
+# Presets contain only ordinary options. No preset-specific rendering paths.
+PRESETS = {
+    "all": {"only": (), "exclude": (), "max_chars": 300},
+    "conversation": {"only": ("role:user", "role:assistant"),
+                     "exclude": ("type:thinking", "type:toolCall"), "max_chars": 300},
+    "tools": {"only": ("type:toolCall", "role:toolResult"),
+              "exclude": (), "max_chars": 300},
+    "trajectory": {"only": ("role:user", "role:assistant", "type:toolCall",
+                            "customType:capability-prefetch",
+                            "customType:capability-trajectory-warning"),
+                   "exclude": ("type:thinking", "role:toolResult", "type:image"),
+                   "max_chars": 300},
 }
-SUMMARY_MAX = 160                 # compaction 摘要截断
-LIST_LIMIT = 30                   # 列表模式最多显示几个会话
+TAG_FIELDS = ("type", "role", "customType")
+CONTEXT_FIELDS = frozenset((*TAG_FIELDS, "id", "parentId", "timestamp"))
+OMIT = object()  # Unlike None, this cannot be a JSON value.
+LIST_LIMIT = 30
 
 # 会话根目录: --session-dir 参数指定，默认 ~/.pi/agent/sessions。
 # 参数名与 pi 本体的 --session-dir 对齐。
@@ -98,61 +48,15 @@ def _c(code, s):
 
 def dim(s):    return _c("2", s)
 def bold(s):   return _c("1", s)
-def red(s):    return _c("31;1", s)
-def green(s):  return _c("32", s)
-def yellow(s): return _c("33", s)
-def blue(s):   return _c("34", s)
-def cyan(s):   return _c("36", s)
-
 # ── 基础工具 ─────────────────────────────────────────────────────────────────
 def flatten(t):
     """换行/连续空白折叠成单个空格。"""
     return " ".join(str(t).split())
 
-def trunc(t, n, mode="head"):
-    """保留 n 个原文字符，省略处标字符数；middle 偏重尾部，不解析路径。"""
+def trunc(t, n):
+    """列表预览折成单行，省略处标字符数。"""
     t = flatten(t)
-    if len(t) <= n:
-        return t
-    omitted = f" …(+{len(t) - n}c)"
-    if mode == "middle" and n > 0:
-        head = n // 3
-        return t[:head] + omitted + " " + t[-(n - head):]
-    return t[:n] + omitted
-
-def fmt_size(n):
-    if n < 1000:       return f"{n}c"
-    if n < 1_000_000:  return f"{n / 1000:.1f}Kc"
-    return f"{n / 1_000_000:.1f}Mc"
-
-def fmt_dur(ms):
-    if ms is None or ms < 0:
-        return ""
-    if ms < 1000:    return f"{ms / 1000:.1f}s"
-    if ms < 60_000:  return f"{ms / 1000:.0f}s"
-    m, s = divmod(int(ms / 1000), 60)
-    h, m = divmod(m, 60)
-    if h:
-        d, h = divmod(h, 24)
-        return f"{d}d{h}h" if d else f"{h}h{m:02d}m"
-    return f"{m}m{s:02d}s"
-
-def parse_ts(iso):
-    try:
-        if isinstance(iso, (int, float)) and not isinstance(iso, bool):
-            return datetime.fromtimestamp(iso / 1000, timezone.utc)
-        return datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
-    except Exception:
-        return None
-
-def fmt_time(iso, ref_date=None):
-    dt = parse_ts(iso)
-    if not dt:
-        return ""
-    dt = dt.astimezone()
-    if ref_date is not None and dt.date() != ref_date:
-        return dt.strftime("%m-%d %H:%M:%S")
-    return dt.strftime("%H:%M:%S")
+    return t if len(t) <= n else t[:n] + f" …(+{len(t) - n}c)"
 
 def die(msg, code=1):
     print(f"pi-snap: {msg}", file=sys.stderr)
@@ -231,8 +135,11 @@ def load_entries(path, strict=False):
                 continue
             try:
                 entry = json.loads(line)
-                if strict and not isinstance(entry, dict):
-                    die(f"第 {line_number} 行不是记录对象，无法分叉")
+                if not isinstance(entry, dict):
+                    if strict:
+                        die(f"第 {line_number} 行不是记录对象，无法分叉")
+                    bad += 1
+                    continue
                 entries.append(entry)
             except ValueError:
                 if strict:
@@ -268,7 +175,9 @@ def export_fork(entries, source, ref, destination):
                 or (parent is not None and not isinstance(parent, str))):
             die("记录 id 重复、缺失或 parentId 无效，无法分叉")
         by_id[eid] = entry
-    current = find_entry(entries[1:], ref)
+    current = find_entry(entries, ref)
+    if current is header:
+        die("分叉截止点必须是会话头之后的记录")
     chain, seen = [], set()
     while current is not None:
         eid = current["id"]
@@ -331,119 +240,6 @@ def export_fork(entries, source, ref, destination):
     print(os.path.abspath(destination))
 
 
-# ── 工具调用参数压缩 ─────────────────────────────────────────────────────────
-class SummaryFormatter(Formatter):
-    """模板仅增加通用的大小/计数格式，不包含工具名判断。"""
-    def get_value(self, key, args, kwargs):
-        return kwargs.get(key, "")
-
-    def format_field(self, value, format_spec):
-        if format_spec == "size":
-            return fmt_size(len(str(value or "")))
-        if format_spec == "count":
-            return str(len(value or []))
-        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
-        return super().format_field(flatten(text), format_spec)
-
-
-SUMMARY_FORMATTER = SummaryFormatter()
-
-
-def fmt_call_args(name, args):
-    """配置模板选取参数；无模板或参数并非对象时保留原始参数摘要。"""
-    config = TOOL_SUMMARIES.get(name, {})
-    if "template" not in config or not isinstance(args, dict):
-        return flatten(args if isinstance(args, str) else json.dumps(args, ensure_ascii=False))
-    text = SUMMARY_FORMATTER.vformat(config["template"], (), args)
-    for part in config.get("optional", ()):
-        if any(args.get(key) is not None for key in part["when_any"]):
-            values = {**part.get("defaults", {}),
-                      **{key: value for key, value in args.items() if value is not None}}
-            text += SUMMARY_FORMATTER.vformat(part["template"], (), values)
-    return text
-
-def system_summary(m, tools=None, initial=False):
-    """只摘要本条保存的环境；工具总数由 parentId 分支上的增减记录重建。"""
-    parts = []
-    sections = m.get("sections") or {}
-    if "cwd" in sections:
-        parts.append("cwd=" + flatten(re.sub(r"</?cwd>", "", sections["cwd"])))
-    for key, label, pattern in (
-        ("skills", "Skills", r"<skill\s*>"),
-        ("mcp_servers", "MCP", r"(?m)^\s*-\s+mcp__[^\s]+"),
-    ):
-        if key in sections:
-            parts.append(f"{label}={len(re.findall(pattern, sections[key]))}")
-    added, removed = m.get("toolsAdded") or [], m.get("toolsRemoved") or []
-    if tools is not None or "toolsAdded" in m or "toolsRemoved" in m:
-        delta = []
-        if added:
-            delta.append(f"+{len(added)}")
-        if removed:
-            delta.append(f"-{len(removed)}")
-        # 初始完整工具列表无需重复标 +N；后续变更仍可定位。
-        suffix = "(" + "/".join(delta) + ")" if delta and not initial else ""
-        parts.append(f"Tools={len(tools) if tools is not None else '?'}{suffix}")
-    if "project_context" in sections:
-        count = len(re.findall(r"<project_instructions\b", sections["project_context"]))
-        parts.append(f"Instructions={count}")
-    content = m.get("content") or ""
-    size = len(content) if isinstance(content, str) else sum(
-        len(p.get("text", "")) for p in content if p.get("type") == "text")
-    size += sum(len(value) if isinstance(value, str) else
-                len(json.dumps(value, ensure_ascii=False)) for value in sections.values())
-    if size or sections:
-        parts.append(f"Prompt={fmt_size(size)}")
-    # 未识别的分区仍可发现，但不展开正文。
-    other = [k for k in sections if k not in
-             {"preamble", "cwd", "skills", "mcp_servers", "project_context"}]
-    if other or not parts and sections:
-        parts.append("sections=" + ", ".join(other or sections))
-    return " · ".join(parts) or "(empty)"
-
-
-# ── 快照渲染 ─────────────────────────────────────────────────────────────────
-def message_parts(message):
-    content = message.get("content") or []
-    if isinstance(content, str):
-        return [{"type": "text", "text": content}]
-    return [part for part in content if isinstance(part, dict)]
-
-
-def dialogue_parts(entry):
-    message = entry.get("message") or {}
-    if entry.get("type") != "message" or message.get("role") not in ("user", "assistant"):
-        return []
-    return [part for part in message_parts(message)
-            if (part.get("type") == "text" and str(part.get("text", "")).strip())
-            or (message.get("role") == "user" and part.get("type") == "image")]
-
-
-def snapshot_visible(entry, trace=False):
-    if entry.get("type") == "custom" and entry.get("customType") == "capability-prefetch-diagnostic":
-        return trace
-    if entry.get("type") in ("compaction", "branch_summary"):
-        return True
-    if entry.get("type") == "context_edit":
-        # 上下文摘除是宿主处理痕迹：轨迹不显示，执行摘要与单条展开可见。
-        return trace
-    if entry.get("type") != "message":
-        return False
-    message = entry.get("message") or {}
-    role = message.get("role")
-    if role == "toolResult":
-        # 轨迹只透出失败或状态未知的结果；执行摘要计入全部结果。
-        return trace or message.get("isError") is not False
-    if role == "system" or dialogue_parts(entry):
-        return True
-    if role != "assistant":
-        return False
-    if any(p.get("type") == "toolCall" for p in message_parts(message)):
-        return True
-    # 无正文也无调用：失败/中断记录属执行细节，只进执行摘要。
-    return trace and message.get("stopReason") in ("aborted", "error", "length")
-
-
 def select_range(entries, seq, since, before):
     """Resolve IDs before view filtering. Boundaries must belong to this branch."""
     bounds = []
@@ -462,369 +258,441 @@ def select_range(entries, seq, since, before):
     return seq[start:end]
 
 
-def render_snapshot(entries, path, show_all, tail, sessions_dir=None, selector=None,
-                    trace=False, since=None, before=None):
-    chain, _ = active_branch(entries)
-    if not chain:
-        die("会话为空或无法解析。")
-
-    branch_seq = [e for e in (entries if show_all else chain) if isinstance(e, dict)]
-    if show_all and (since is not None or before is not None):
-        die("区间查询不能与 --all 混用；请使用当前分支的记录 ID")
-    seq = list(trajectory_records(select_range(entries, branch_seq, since, before), reorder=not show_all))
-    # Inventory inheritance always follows the original parent chain.
-    branch_seq = list(trajectory_records(branch_seq, reorder=False))
-    visible = lambda e: snapshot_visible(e, trace)
-    visible_indices = [i for i, entry in enumerate(seq) if visible(entry)]
-    total_visible = len(visible_indices)
-    omitted = max(0, total_visible - tail) if tail is not None else 0
-    if omitted:
-        seq = seq[visible_indices[omitted]:]
-
-    # 头部信息。注意: session 条目(type=session)不参与 parentId 链——
-    # 后续条目的 parentId 是 null，不在 session 条目上，所以要单独找。
-    root = next((e for e in entries if isinstance(e, dict)
-                 and e.get("type") == "session"), None) or {}
-    sid = root.get("id") or session_id_of(path)
-    t0 = parse_ts(root.get("timestamp")) or parse_ts(chain[0].get("timestamp"))
-    t1 = parse_ts(chain[-1].get("timestamp"))
-    ref_date = t0.astimezone().date() if t0 else None
-    name = model = None
-    turns = 0
-    for e in chain:
-        et = e.get("type")
-        if et == "session_info" and e.get("name"):
-            name = e["name"]
-        elif et == "model_change":
-            model = f"{e.get('provider', '?')}/{e.get('modelId', '?')}"
-        elif et == "message" and (e.get("message") or {}).get("role") == "user":
-            turns += 1
-
-    span = fmt_dur((t1 - t0).total_seconds() * 1000) if t0 and t1 else ""
-    print(bold(f"session {sid}"))
-    line2 = ""
-    if t0:
-        f0 = t0.astimezone().strftime("%Y-%m-%d %H:%M")
-        # 同一天结束就不重复日期
-        f1 = t1.astimezone().strftime("%m-%d %H:%M" if t1.astimezone().date() != t0.astimezone().date()
-                                     else "%H:%M") if t1 else "?"
-        line2 = f"{f0} → {f1}" + (f" · {span}" if span else "")
-    cwd = root.get("cwd", "")
-    print("  ".join(x for x in (line2, cwd) if x))
-    if name:
-        print(f"name: {name}")
-    meta = []
-    if model:
-        meta.append(f"model {model}")
-    meta.append(f"{turns} 轮")
-    on_branch = {c.get("id") for c in chain}
-    off_branch = [e for e in entries if e.get("id") not in on_branch
-                  and e.get("type") in ("message", "compaction")]
-    meta.append(f"{len(chain)}/{len(entries)} 条记录在当前分支" if off_branch
-                else f"{len(chain)} 条记录")
-    view = "执行摘要" if trace else "轨迹"
-    meta.append(f"{view}显示 {total_visible - omitted}/{total_visible} 条")
-    if omitted:
-        meta.append(f"省略前 {omitted} 条 (--tail {tail})")
-    if since is not None or before is not None:
-        meta.append(f"区间 [{since or '起点'}, {before or '终点'})")
-    print(dim(" · ".join(meta)))
-    print()
-
-    # Index the whole branch, not only the window: a result outside the window
-    # is not a missing result, and tool inventories inherit earlier system entries.
-    pending, result_ids = {}, set()
-    tool_states, system_summaries = {}, {}
-    for entry in branch_seq:
-        message = entry.get("message") or {}
-        tools = tool_states.get(entry.get("parentId"))
-        if message.get("role") == "system":
-            initial = tools is None and "toolsAdded" in message and not message.get("toolsRemoved")
-            if "toolsAdded" in message or "toolsRemoved" in message:
-                if tools is not None or "toolsAdded" in message:
-                    tools = set(tools or ())
-                    # Pi persists removals as full tool objects, not bare names.
-                    tools.difference_update(
-                        t["name"] if isinstance(t, dict) else t
-                        for t in message.get("toolsRemoved") or [])
-                    tools.update(t["name"] for t in message.get("toolsAdded") or [])
-                    tools = frozenset(tools)
-            system_summaries[entry.get("id")] = system_summary(message, tools, initial)
-        tool_states[entry.get("id")] = tools
-        if message.get("role") == "assistant":
-            for part in message_parts(message):
-                if part.get("type") == "toolCall" and part.get("id"):
-                    pending[part["id"]] = parse_ts(entry.get("timestamp"))
-        elif message.get("role") == "toolResult":
-            result_ids.add(message.get("toolCallId"))
-
-    if not trace:
-        print(dim("轨迹视图：对话正文完整；工具显示请求参数，失败或未知结果透出一行状态；未产生内容的失败响应、上下文摘除与结果摘要用 --trace，原文用单条详情。"))
-    if any(e.get("_host_position") is not None for e in seq):
-        print(dim("预取按已记录的执行时间展示，另注父记录落盘时间；仅在同一分支、同一用户/上下文区间且时间完整一致时前移。--all 保留落盘顺序；ID 区间仍按原记录链。"))
-    if not total_visible:
-        print(dim("当前视图无可显示记录。"))
-    first = True
-    for e in seq:
-        if not isinstance(e, dict):
-            continue
-        mark = "" if e.get("id") in on_branch else "~"
-        if not mark and not first and e.get("type") == "message" \
-                and (e.get("message") or {}).get("role") == "user":
-            print()  # 轮与轮之间空一行
-        if e.get("type") == "context_edit" and not trace:
-            continue  # 上下文摘除属执行细节，轨迹视图不显示
-        if e.get("type") in ("compaction", "context_edit", "branch_summary"):
-            tstr = fmt_time(e.get("timestamp", ""), ref_date)
-            chead = f"{mark}{dim('[' + str(e.get('id', '?')) + ']')}"
-            if tstr:
-                chead += " " + dim(f"[{tstr}]")
-            kind = e.get("type")
-            label = "✦ compact" if kind == "compaction" else kind
-            if kind == "context_edit":
-                action = "removed" if e.get("replacement") is None else "replaced"
-                detail = f"target={e.get('targetId', '?')} {action}; prior content may no longer be visible"
-            else:
-                detail = (trunc(e.get("summary", ""), SUMMARY_MAX) if trace else
-                          f"summary omitted ({len(e.get('summary') or '')} chars)")
-            print(f"{chead} {yellow('[' + label + ']')}  {detail}")
-            first = False
-            continue
-        if e.get("type") == "custom" and e.get("customType") == "capability-prefetch-diagnostic":
-            if trace:
-                stamp = fmt_time(e.get("timestamp"), ref_date)
-                head = f"{mark}[{e.get('id', '?')}]" + (f" [{stamp}]" if stamp else "")
-                print(f"{head} [discovery] {diagnostic_summary(e.get('data') or {})}")
-                first = False
-            continue
-        if e.get("type") != "message":
-            continue
-        lines = render_message(e, mark, ref_date, pending, result_ids,
-                               system_summaries.get(e.get("id")), trace=trace)
-        if lines:
-            if e.get("_host_position") is not None:
-                persisted = fmt_time(e.get("_persisted_at"), ref_date) or "未知"
-                note = "执行时间未知；" if not parse_ts(e.get("timestamp")) else ""
-                lines = [line + dim(f" [{note}落盘 {persisted}]") for line in lines]
-            print("\n".join(lines))
-            first = False
-
-    print()
-    hints = []
-    if off_branch:
-        hints.append(f"{len(off_branch)} 条被回退丢弃(--all 可见)")
-    hints.append("看某条完整内容: "
-                 + copy_prefix(sessions_dir) + shlex.quote(selector or sid) + " <entry-id>")
-    print(dim("─" * 8 + " " + " · ".join(hints)))
-
-def render_message(e, mark, ref_date, pending, result_ids, system_text=None, trace=True):
-    """单条 message 渲染成若干行；每行统一 [id] [time] [type] 内容。
-    工具调用不是独立记录，沿用所属 assistant 条目的 id/时间；
-    纯工具调用的条目不输出 [assistant] 行(它只表示 Agent 说的话)。"""
-    m = e.get("message") or {}
-    role = m.get("role")
-    eid = e.get("id", "?")
-    tstr = fmt_time(e.get("timestamp", ""), ref_date)
-    # 行首统一: [id] [time] [type] 内容
-    head = f"{mark}{dim('[' + str(eid) + ']')}"
-    if tstr:
-        head += " " + dim(f"[{tstr}]")
-    if e.get("_host_position") is not None:
-        head += " " + dim("[recommend]")
-
-    if role == "system":
-        return [f"{head} {yellow('[system]')}  "
-                + (system_text if system_text is not None else system_summary(m))]
-
-    if role == "user":
-        out = []
-        for p in message_parts(m):
-            if p.get("type") == "text" and str(p.get("text", "")).strip():
-                body = trunc(p.get('text', ''), USER_MAX) if trace else p.get('text', '')
-                out.append(f"{head} {green('[user]')}  {body}")
-            elif p.get("type") == "image":
-                out.append(f"{head} {green('[user]')}  [image]")
-        return out or None
-
-    if role == "assistant":
-        out = []
-        reason = m.get("stopReason")
-        for p in message_parts(m):
-            pt = p.get("type")
-            if pt == "text" and str(p.get("text", "")).strip():
-                body = trunc(p.get('text', ''), ASST_MAX) if trace else p.get('text', '')
-                out.append(f"{head} {blue('[assistant]')}  {body}")
-            elif pt == "toolCall":
-                config = TOOL_SUMMARIES.get(p.get("name"), {})
-                args_s = (trunc(fmt_call_args(p.get("name"), p.get("arguments")),
-                                config.get("max_chars", ARGS_MAX), config.get("truncate", "head")) if trace else
-                          trajectory_call_args(p.get("name"), p.get("arguments")))
-                note = ""
-                if p.get("id") not in result_ids:
-                    note = " [未记录结果；是否开始执行未知]"
-                    if reason in ("aborted", "error", "length"):
-                        note = " [响应未完成，参数可能不完整；未记录结果]"
-                out.append(f"{head} {cyan('[→ ' + p.get('name', '?') + ']')}  {dim(args_s)}{yellow(note)}")
-        if not out and not trace:
-            return None  # 无正文也无调用：失败/中断记录轨迹不显示，仅执行摘要可见
-        if reason in ("aborted", "error", "length"):
-            label = {"aborted": "响应已中断（取消来源未知）",
-                     "error": "响应失败", "length": "响应达到长度限制"}[reason]
-            parts = message_parts(m)
-            last = next((p for p in reversed(parts)
-                         if p.get("type") in ("thinking", "text", "toolCall")), {})
-            kind = last.get("type")
-            stage = {"thinking": "思考", "text": "文字", "toolCall": "工具请求"}.get(kind)
-            detail = f"最后保存的内容：{stage}" if stage else "未保存响应内容"
-            if kind in ("thinking", "text") and not last.get(kind):
-                detail += "（仅空块，无正文）"
-            error = trunc(m.get("errorMessage") or "", ASST_MAX)
-            out.append(f"{head} {yellow('[status]')} {label}；{detail}"
-                       + (f"；{error}" if error else ""))
-        return out or None
-
-    if role == "toolResult":
-        name = m.get("toolName", "?")
-        if not trace:
-            if m.get("isError") is False:
-                return None  # 成功执行整条不显示；详情走 --trace 或单条展开
-            status = "ERR" if m.get("isError") is True else "unknown"
-            return [f"{head} {yellow('[← ' + name + ']')} {status}"]
-        text = "".join(p.get("text", "") for p in (message_parts(m))
-                       if p.get("type") == "text")
-        nimg = sum(1 for p in (message_parts(m)) if p.get("type") == "image")
-        dur = ""
-        t0 = pending.pop(m.get("toolCallId"), None)
-        t1 = parse_ts(e.get("timestamp"))
-        if t0 and t1:
-            dur = fmt_dur((t1 - t0).total_seconds() * 1000)
-        status = red("ERR") if m.get("isError") else "ok"
-        config = TOOL_SUMMARIES.get(name, {}).get("result", {})
-        meta = config.get("template", RESULT_TEMPLATE).format(
-            status=status, size=fmt_size(len(text)),
-            lines=text.count("\n") + int(bool(text) and not text.endswith("\n")),
-            duration=" " + dur if dur else "")
-        line = f"{head} {yellow('[← ' + name + ']')} {meta}"
-        preview_key = "error_preview_chars" if m.get("isError") else "preview_chars"
-        preview_chars = config.get(preview_key, PEEK_MAX)
-        if preview_chars > 0 and text.strip():
-            line += "  " + trunc(text, preview_chars)
-        if nimg:
-            line += dim("  [image]")
-        return [line]
-
-    return None
-
-# Default trajectory shares message rendering with the explicit --trace view.
-# Consumers must not reimplement tool/event semantics.
-def trajectory_call_args(name, args):
-    if name in TOOL_SUMMARIES:
-        config = TOOL_SUMMARIES[name]
-        return trunc(fmt_call_args(name, args),
-                     min(config.get("max_chars", ARGS_MAX), TRAJECTORY_ARGS_MAX),
-                     config.get("truncate", "head"))
-
-    def compact(value, depth=0):
-        if isinstance(value, dict):
-            priority = ("model", "provider", "cwd", "task", "command", "path")
-            keys = [k for k in priority if k in value]
-            keys += [k for k in value if k not in priority]
-            out = {}
-            for key in keys[:16]:
-                if key.lower() in {"content", "base64", "data", "image", "images", "payload",
-                                   "oldtext", "newtext", "thinking"}:
-                    out[key] = "[payload omitted]"
-                else:
-                    out[key] = compact(value[key], depth + 1) if depth < 3 else "[…]"
-            if len(keys) > 16:
-                out["…"] = "keys omitted"
-            return out
-        if isinstance(value, list):
-            return ([compact(item, depth + 1) for item in value[:4]]
-                    + (["[… items omitted]"] if len(value) > 4 else [])) if depth < 3 else "[…]"
-        return trunc(value, 180) if isinstance(value, str) else value
-
-    return trunc(fmt_call_args(name, compact(args)), TRAJECTORY_ARGS_MAX)
+# ── 时间语义（独立于类型筛选与渲染）──────────────────────────────────────────
+def parse_ts(value):
+    try:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return datetime.fromtimestamp(value / 1000, timezone.utc)
+        if not isinstance(value, str):
+            return None
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        # Do not interpret a timestamp with an unknown timezone as local time.
+        return parsed.astimezone(timezone.utc) if parsed.utcoffset() is not None else None
+    except (ValueError, OverflowError, OSError):
+        return None
 
 
-def diagnostic_summary(data):
-    """Small allowlisted index, not a dump of prompts, raw errors or tool outputs."""
-    bits = [str(data.get("trigger", "?")), str(data.get("event", "?"))]
-    for key in ("reason", "preparation", "delivery", "outcome", "warningCount", "resetFromSteps", "requests"):
-        if key in data:
-            bits.append(f"{key}={trunc(str(data[key]), 80)}")
-    if "steps" in data:
-        bits.append(f"steps={data['steps']}/{data.get('interval', '?')}")
-    for key, label in (("configuredOptions", "configuredReview"), ("effectiveOptions", "effectiveReview")):
-        options = data.get(key) or {}
-        if "trajectoryWarnings" in options:
-            bits.append(f"{label}={str(options['trajectoryWarnings']).lower()}")
-    if (data.get("childSession") or {}).get("id"):
-        bits.append(f"child={data['childSession']['id']}")
-    return " · ".join(bits)
+def format_ts(value):
+    return value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-def trajectory_records(entries, reorder=True):
-    """Project actual preparation tools, retaining source IDs and persistence time.
-    Ordinary records never reorder. Move a complete, consistently timed batch only
-    backwards along its own ancestry, with a known lower time bound. Never cross a
-    user/context boundary or the selected raw-ID window. No cross-branch --all sort.
+def record_clock(record):
+    """Pi message time and known host execution times, never guessed from prose.
+
+    A preparation batch is one source record, with several actual event times.
+    Its outer timestamp is persistence provenance, NOT an execution fallback.
     """
-    entries = list(entries)
-    by_id = {e.get("id"): i for i, e in enumerate(entries)}
-    buckets = [[] for _ in entries]
+    message = record.get("message")
+    body = message if isinstance(message, dict) else record
+    persisted = parse_ts(record.get("timestamp"))
+    if body.get("customType") != "capability-prefetch":
+        stamp = parse_ts(body.get("timestamp")) if "timestamp" in body else persisted
+        return {"times": [stamp] if stamp else [], "missing": stamp is None,
+                "preparation": False, "persisted": persisted}
+    details = body.get("details")
+    prefetch = details.get("prefetch") if isinstance(details, dict) else None
+    rounds = prefetch.get("rounds") if isinstance(prefetch, dict) else None
+    stamps = []
+    for batch in rounds if isinstance(rounds, list) else []:
+        messages = batch.get("messages") if isinstance(batch, dict) else None
+        for item in messages if isinstance(messages, list) else []:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            is_call = item.get("role") == "assistant" and isinstance(content, list) and any(
+                isinstance(part, dict) and part.get("type") == "toolCall" for part in content)
+            if is_call or item.get("role") == "toolResult":
+                stamps.append(parse_ts(item.get("timestamp")))
+    return {"times": [stamp for stamp in stamps if stamp is not None],
+            "missing": not stamps or any(stamp is None for stamp in stamps),
+            "preparation": True, "persisted": persisted}
+
+
+def clock_label(clock):
+    times = clock["times"]
+    label = "执行" if clock["preparation"] else "时间"
+    if times:
+        first, last = min(times), max(times)
+        result = f"[{label} {format_ts(first)}"
+        if last != first:
+            result += f" … {format_ts(last)}"
+        result += "]"
+        if clock["missing"]:
+            result += " [部分执行时间未知]"
+    else:
+        result = f"[{label}时间未知]" if label == "执行" else "[时间未知]"
+    if clock["preparation"]:
+        persisted = clock["persisted"]
+        result += f" [落盘 {format_ts(persisted) if persisted else '未知'}]"
+        if times and (times != sorted(times) or (persisted and max(times) > persisted)):
+            result += " [时间冲突；保留原位置]"
+    return result
+
+
+def timed_records(entries, reorder=True):
+    """Attach clocks and safely move delayed batches along their own ancestry.
+
+    Preserve each complete source record, unlike the former lossy tool-message
+    projection. Ordinary records never reorder; no move crosses a user/context
+    boundary, another preparation batch, or a raw-ID range boundary. An unknown
+    or conflicting clock cannot establish ordering.
+    """
+    rows = [(entry, record_clock(entry)) for entry in entries]
+    by_id = {entry.get("id"): i for i, (entry, _) in enumerate(rows)}
+    buckets = [[] for _ in rows]
     barriers = {"compaction", "context_edit", "branch_summary"}
-    for index, entry in enumerate(entries):
-        message = entry.get("message") or (entry if entry.get("type") == "custom_message" else {})
-        if message.get("customType") != "capability-prefetch":
-            buckets[index].append(entry)
-            continue
-        projected = []
-        for ri, round_ in enumerate(((message.get("details") or {}).get("prefetch") or {}).get("rounds") or []):
-            for mi, item in enumerate(round_.get("messages") or []):
-                if item.get("role") not in ("assistant", "toolResult"):
-                    continue
-                if item.get("role") == "assistant":
-                    item = dict(item, content=[p for p in message_parts(item) if p.get("type") == "toolCall"])
-                projected.append(dict(type="message", id=entry.get("id"), _host_position=f"{ri}/{mi}",
-                                      parentId=entry.get("parentId"), timestamp=item.get("timestamp"),
-                                      _persisted_at=entry.get("timestamp"), message=item))
-        times = [parse_ts(e.get("timestamp")) for e in projected]
-        persisted = parse_ts(entry.get("timestamp"))
+    for index, (entry, clock) in enumerate(rows):
+        times, persisted = clock["times"], clock["persisted"]
         target = index
-        if reorder and times and all(times) and persisted:
-            stamps = [t.timestamp() for t in times]
-            if stamps == sorted(stamps) and stamps[-1] <= persisted.timestamp():
-                cursor, candidate = entry.get("parentId"), index
-                seen = set()
-                while cursor in by_id and cursor not in seen:
-                    seen.add(cursor)
-                    pos = by_id[cursor]
-                    if pos >= index:
-                        break
-                    ancestor = entries[pos]
-                    when = parse_ts(ancestor.get("timestamp"))
-                    if when and when.timestamp() <= stamps[0]:
-                        target = candidate
-                        break
-                    ancestor_message = ancestor.get("message") or ancestor
-                    boundary = (ancestor.get("type") in barriers
-                                or ancestor_message.get("role") in ("user", "system")
-                                or ancestor_message.get("customType") == "capability-prefetch")
-                    if boundary or not when or when.timestamp() < stamps[-1]:
-                        break
-                    candidate, cursor = pos, ancestor.get("parentId")
-        # Insert ahead of the anchor's ordinary entry, not after it.
+        if (reorder and clock["preparation"] and not clock["missing"] and persisted
+                and times == sorted(times) and times[-1] <= persisted):
+            cursor, candidate, seen = entry.get("parentId"), index, set()
+            while cursor in by_id and cursor not in seen:
+                seen.add(cursor)
+                pos = by_id[cursor]
+                if pos >= index:
+                    break
+                ancestor, ancestor_clock = rows[pos]
+                known = ancestor_clock["times"] if not ancestor_clock["missing"] else []
+                when = max(known) if known else None
+                if when and when <= times[0]:
+                    target = candidate
+                    break
+                message = ancestor.get("message")
+                body = message if isinstance(message, dict) else ancestor
+                if (ancestor.get("type") in barriers or body.get("role") in ("user", "system")
+                        or ancestor_clock["preparation"] or not when or when < times[-1]):
+                    break
+                candidate, cursor = pos, ancestor.get("parentId")
         if target < index:
-            buckets[target][0:0] = projected
+            buckets[target].insert(0, (entry, clock))
         else:
-            buckets[index].extend(projected)
+            buckets[index].append((entry, clock))
     for bucket in buckets:
         yield from bucket
 
 
+# ── 结构筛选与统一渲染 ───────────────────────────────────────────────────────
+def parse_selectors(values):
+    """A selector is a raw tag value, optionally qualified by its JSON key."""
+    selectors = []
+    for group in values:
+        for token in group.split(","):
+            token = token.strip()
+            if not token:
+                raise ValueError("类型筛选不能为空")
+            if ":" in token:
+                key, value = token.split(":", 1)
+                if key not in TAG_FIELDS or not value:
+                    raise ValueError("限定筛选使用 type:值、role:值 或 customType:值")
+                selectors.append((key, value))
+            else:
+                selectors.append((None, token))
+    return tuple(selectors)
 
-# ── 列表模式 ─────────────────────────────────────────────────────────────────
+
+def resolve_options(preset="all", only=None, exclude=None, max_chars=None):
+    base = PRESETS[preset]
+    return {
+        "only": parse_selectors(base["only"] if only is None else only),
+        "exclude": parse_selectors((*base["exclude"], *(exclude or ()))),
+        "max_chars": base["max_chars"] if max_chars is None else max_chars,
+    }
+
+
+def matches(node, selectors):
+    return any(any(isinstance(node.get(field), str) and node[field] == value
+                   for field in ((key,) if key else TAG_FIELDS))
+               for key, value in selectors)
+
+
+def filter_record(record, only=(), exclude=()):
+    """Project structural tags, without changing sources or inventing events.
+
+    Include opens a whole subtree; exclude always wins. Ancestors of a match
+    retain identity/context fields, not unrelated sibling payloads. Lists keep
+    the order of surviving items, including null/false/empty values.
+    """
+    if not only and not exclude:
+        return record
+    message = record.get("message") if isinstance(record, dict) else None
+    if record.get("type") == "message" and isinstance(message, dict) and matches(message, exclude):
+        return OMIT  # A message-level exclusion must not leave an empty envelope row.
+
+    def visit(value, included):
+        if isinstance(value, dict):
+            if matches(value, exclude):
+                return OMIT
+            included = included or matches(value, only)
+            result = {}
+            for key, child in value.items():
+                selected = visit(child, included)
+                if selected is not OMIT:
+                    result[key] = selected
+            if included:
+                return result
+            if not result:
+                return OMIT
+            return {key: result[key] if key in result else child
+                    for key, child in value.items()
+                    if key in result or key in CONTEXT_FIELDS}
+        if isinstance(value, list):
+            result = []
+            for child in value:
+                selected = visit(child, included)
+                if selected is not OMIT:
+                    result.append(selected)
+            return result if included or result else OMIT
+        return value if included else OMIT
+
+    return visit(record, not only)
+
+
+def value_lines(value, indent=0, label=None):
+    """Full entry details: every JSON field, with terminal controls escaped."""
+    pad = " " * indent
+    prefix = pad + (label + ":" if label is not None else "-")
+    if isinstance(value, (dict, list)):
+        if not value:
+            yield prefix + (" {}" if isinstance(value, dict) else " []")
+            return
+        yield prefix
+        if isinstance(value, dict):
+            for key, child in value.items():
+                yield from value_lines(child, indent + 2,
+                                       json.dumps(key, ensure_ascii=False))
+        else:
+            for child in value:
+                yield from value_lines(child, indent + 2)
+        return
+    if isinstance(value, str):
+        if "\n" in value:
+            yield prefix + " |"
+            for line in value.split("\n"):
+                yield pad + "  " + json.dumps(line, ensure_ascii=False)[1:-1]
+            return
+    annotation = ""
+    if label == '"timestamp"' and isinstance(value, (int, float)) and not isinstance(value, bool):
+        stamp = parse_ts(value)
+        if stamp is not None:
+            annotation = " [UTC " + format_ts(stamp) + "]"
+    yield prefix + " " + json.dumps(value, ensure_ascii=False) + annotation
+
+
+# Only established protocol metadata is detail-only. Unknown fields use the
+# generic fallback; tool names never select different formatting policies.
+MESSAGE_METADATA = frozenset({"api", "provider", "model", "usage", "responseId",
+                              "rawStopReason", "durationMs", "thinkingLevel", "toolCallId"})
+BLOCK_METADATA = frozenset({"textSignature", "thinkingSignature"})
+
+
+def one_line(value):
+    text = flatten(value)
+    return "".join(f"\\u{ord(char):04x}" if ord(char) < 32 or ord(char) == 127 else char
+                   for char in text)
+
+
+def inline_value(value):
+    if isinstance(value, str):
+        return one_line(value) or '""'
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def inline_fields(fields):
+    return ", ".join(f"{one_line(key)}={inline_value(value)}" for key, value in fields.items())
+
+
+def preparation_content(body):
+    """Separate saved host messages for readable rows without changing sources.
+
+    Suggestions and unknown nested objects stay ordinary data, not tool events.
+    Empty containers created by extraction are omitted from the summary only.
+    """
+    if body.get("customType") != "capability-prefetch":
+        return body, []
+    details = body.get("details")
+    prefetch = details.get("prefetch") if isinstance(details, dict) else None
+    rounds = prefetch.get("rounds") if isinstance(prefetch, dict) else None
+    if not isinstance(rounds, list):
+        return body, []
+    messages, remaining = [], []
+    for batch in rounds:
+        if not isinstance(batch, dict) or not isinstance(batch.get("messages"), list):
+            remaining.append(batch)
+            continue
+        rest, other = dict(batch), []
+        for item in batch["messages"]:
+            if isinstance(item, dict) and item.get("role") in ("assistant", "toolResult"):
+                messages.append(item)
+            else:
+                other.append(item)
+        if other:
+            rest["messages"] = other
+        else:
+            rest.pop("messages")
+        if rest:
+            remaining.append(rest)
+    pref = dict(prefetch)
+    if remaining:
+        pref["rounds"] = remaining
+    else:
+        pref.pop("rounds")
+    detail = dict(details)
+    if pref:
+        detail["prefetch"] = pref
+    else:
+        detail.pop("prefetch")
+    result = dict(body)
+    if detail:
+        result["details"] = detail
+    else:
+        result.pop("details")
+    return result, messages
+
+
+def record_rows(record, clock=None):
+    """Yield (label, body, clock) using basic content shapes plus one fallback."""
+    clock = record_clock(record) if clock is None else clock
+    message = record.get("message")
+    wrapped = record.get("type") == "message" and isinstance(message, dict)
+    body = message if wrapped else record
+    body, prepared = preparation_content(body)
+    is_message = wrapped or record.get("type") == "custom_message"
+    if is_message:
+        label = next((body[key] for key in ("customType", "role", "type")
+                      if isinstance(body.get(key), str)), "record")
+    else:
+        label = "/".join(body[key] for key in TAG_FIELDS if isinstance(body.get(key), str)) or "record"
+    result_message = is_message and body.get("role") == "toolResult"
+    if result_message:
+        label = "← " + str(body.get("toolName", "?"))
+    metadata = MESSAGE_METADATA if wrapped else frozenset()
+    consumed = (CONTEXT_FIELDS | metadata | {"content"}) - {
+        key for key in TAG_FIELDS if key in body and not isinstance(body[key], str)}
+    if result_message:
+        consumed = consumed | {"toolName"}
+    extras = {key: value for key, value in body.items() if key not in consumed}
+    outer = {key: value for key, value in record.items()
+             if key not in CONTEXT_FIELDS and key != "message"} if wrapped else {}
+    rows = []
+    content = body.get("content", OMIT)
+    parts = content if isinstance(content, list) else [content] if content is not OMIT else []
+    for part in parts:
+        part_label = label
+        if not isinstance(part, dict):
+            text = inline_value(part)
+        else:
+            kind = part.get("type")
+            consumed_part = {"type"} if isinstance(kind, str) else set()
+            if kind in ("text", "thinking") and isinstance(part.get(kind), str):
+                text = inline_value(part[kind])
+                consumed_part = consumed_part | BLOCK_METADATA | {kind}
+                if kind == "thinking":
+                    part_label = "thinking"
+            elif kind == "toolCall":
+                part_label = "→ " + str(part.get("name", "?"))
+                args = part.get("arguments", OMIT)
+                text = inline_fields(args) if isinstance(args, dict) else (
+                    "arguments=" + inline_value(args) if args is not OMIT else "")
+                consumed_part = consumed_part | {"id", "name", "arguments"}
+            else:
+                part_label = str(kind) if isinstance(kind, str) else label
+                # Tool-result blocks retain result attribution, including images.
+                if result_message:
+                    part_label = label + ("/" + str(kind) if kind else "")
+                text = ""
+            extra = inline_fields({key: value for key, value in part.items() if key not in consumed_part})
+            text = " · ".join(value for value in (text, extra) if value)
+        rows.append((part_label, text or "{}", clock))
+    extra = inline_fields(extras)
+    if outer:
+        extra = ", ".join(value for value in (extra, "entry=(" + inline_fields(outer) + ")") if value)
+    if rows:
+        first_label, first_text, _ = rows[0]
+        rows[0] = (first_label, " · ".join(value for value in (first_text, extra) if value), clock)
+    elif extra or not prepared or content is not OMIT:
+        rows.append((label, extra or ("content=" + inline_value(content) if content is not OMIT else "{}"), clock))
+    for item in prepared:
+        child = {"type": "message", "message": item}
+        # Never inherit the batch/persistence time for a message with no timestamp.
+        child_clock = record_clock(child)
+        for child_label, text, when in record_rows(child, child_clock):
+            rows.append(("recommend " + child_label, text, when))
+    return rows
+
+
+def short_time(stamp, ref_date=None):
+    if stamp is None:
+        return "--:--:--"
+    local = stamp.astimezone()
+    return local.strftime("%Y-%m-%d %H:%M:%S" if ref_date and local.date() != ref_date else "%H:%M:%S")
+
+
+def render_record(record, number, width=4, mark="", max_chars=300, clock=None, ref_date=None):
+    clock = record_clock(record) if clock is None else clock
+    batch_times = clock["times"]
+    batch_conflict = clock["preparation"] and batch_times and (
+        batch_times != sorted(batch_times) or (clock["persisted"] and max(batch_times) > clock["persisted"]))
+    for label, text, when in record_rows(record, clock):
+        times = when["times"]
+        stamp = min(times) if times else None
+        note = ""
+        if times and (when["missing"] or (clock["preparation"] and clock["missing"])):
+            note = " [部分时间未知]"
+        if batch_conflict:
+            note += " [时间冲突]"
+        text = one_line(text)
+        if max_chars and len(text) > max_chars:
+            text = text[:max_chars] + f" …(+{len(text) - max_chars}c)"
+        print(f"{mark}[{number:>{width}}] {short_time(stamp, ref_date)} [{one_line(label)}] {text}{note}")
+
+
+def render_snapshot(entries, path, show_all, tail, since=None, before=None,
+                    options=None, since_time=None, before_time=None):
+    chain, _ = active_branch(entries)
+    root = next((e for e in entries if e.get("type") == "session"), None)
+    if show_all and (since is not None or before is not None):
+        die("区间查询不能与 --all 混用；请使用当前分支的记录 ID")
+    branch = list(chain)
+    if root is not None and not any(e is root for e in branch):
+        branch.insert(0, root)
+    selected = select_range(entries, entries if show_all else branch, since, before)
+    options = options or resolve_options()
+    numbers = {id(entry): number for number, entry in enumerate(entries, 1)}
+    visible = []
+    unknown_times = 0
+    for record, clock in timed_records(selected, reorder=not show_all):
+        if since_time is not None or before_time is not None:
+            unknown_times += int(clock["missing"])
+            if not any((since_time is None or stamp >= since_time)
+                       and (before_time is None or stamp < before_time) for stamp in clock["times"]):
+                continue
+        projected = filter_record(record, options["only"], options["exclude"])
+        if projected is not OMIT:
+            visible.append((projected, clock, numbers[id(record)]))
+    if unknown_times:
+        print(f"pi-snap: {unknown_times} 条记录部分或全部时间未知，未知部分不能按时间筛选。", file=sys.stderr)
+    if tail is not None:
+        visible = visible[-tail:]
+
+    sid = (root or {}).get("id") or session_id_of(path)
+    reference = parse_ts((root or {}).get("timestamp"))
+    if reference is None:
+        reference = next((clock["times"][0] for entry in branch
+                          if (clock := record_clock(entry))["times"]), None)
+    ref_date = reference.astimezone().date() if reference else None
+    date_label = reference.astimezone().strftime(" · %Y-%m-%d %z") if reference else ""
+    print(bold("session " + one_line(sid) + date_label))
+    width = max(4, len(str(len(entries))))
+    on_branch = {id(entry) for entry in branch}
+    branch_numbers = {numbers[key] for key in on_branch}
+    for record, clock, number in visible:
+        mark = (" " if number in branch_numbers else "~") if show_all else ""
+        render_record(record, number, width, mark, options["max_chars"], clock, ref_date)
+    if not visible:
+        print(dim("当前筛选无可显示记录。"))
+
+
 def peek_head(path, max_lines=60, preview=True):
     """只读文件开头: session 条目(id/cwd) + 第一条 user 消息预览。
 
@@ -845,12 +713,15 @@ def peek_head(path, max_lines=60, preview=True):
                 if e.get("type") == "session" and not sid:
                     sid, cwd = e.get("id", ""), e.get("cwd", "")
                 elif e.get("type") == "message" and not first_user:
-                    m = e.get("message") or {}
-                    if m.get("role") == "user":
-                        txt = " ".join(str(p.get("text", "")) for p in (m.get("content") or [])
-                                       if p.get("type") == "text").strip()
-                        if txt:
-                            first_user = txt
+                    m = e.get("message")
+                    if isinstance(m, dict) and m.get("role") == "user":
+                        content = m.get("content")
+                        txt = content if isinstance(content, str) else " ".join(
+                            str(p.get("text", "")) for p in content
+                            if isinstance(p, dict) and p.get("type") == "text"
+                        ) if isinstance(content, list) else ""
+                        if txt.strip():
+                            first_user = txt.strip()
                 # 要的东西到手就在本行末尾收手：for 循环顶部的 break 会先读下一行，
                 # 头部后面紧跟巨大单行(如 system 正文)时会白读进来
                 if sid and (not preview or first_user):
@@ -882,7 +753,7 @@ def list_sessions(sessions_dir):
         rows.append((os.path.getmtime(p), sid, place_label(p, sessions_dir, cwd),
                      flatten(first_user), p))
     rows.sort(key=lambda r: -r[0])
-    hdr = bold(f"{len(rows)} 个会话") + dim(f" · {copy_prefix(sessions_dir)}<头部id> 打开快照")
+    hdr = bold(f"{len(rows)} 个会话") + dim(f" · {copy_prefix(sessions_dir)}<头部id> 打开记录")
     if not is_default_dir(sessions_dir):
         hdr += dim(f"\n会话目录: {sessions_dir}")
     print(hdr)
@@ -905,6 +776,15 @@ def list_sessions(sessions_dir):
 
 # ── 单条完整视图 ─────────────────────────────────────────────────────────────
 def find_entry(entries, ref):
+    if ref.startswith("id:"):
+        ref = ref[3:]
+        if not ref:
+            die("id: 后需要原始记录 ID", 2)
+    elif ref.isascii() and ref.isdigit():
+        number = int(ref)
+        if 1 <= number <= len(entries):
+            return entries[number - 1]
+        die(f"记录序号 {ref} 超出范围 1..{len(entries)}", 2)
     exact = [e for e in entries if isinstance(e, dict) and e.get("id") == ref]
     if len(exact) == 1:
         return exact[0]
@@ -918,109 +798,96 @@ def find_entry(entries, ref):
         die(f"找不到记录 {ref!r}")
     print("该前缀匹配多条记录，请加长前缀:")
     for e in cands:
-        m = e.get("message") or {}
+        m = e.get("message") if isinstance(e.get("message"), dict) else {}
         print(f"  {e.get('id')}  {e.get('type')}"
               + (f"/{m.get('role')}" if m.get("role") else ""))
     sys.exit(2)
 
-def render_entry_full(e, on_branch, as_json):
+def render_entry_full(e, on_branch, as_json, number=None):
     if as_json:
         print(json.dumps(e, ensure_ascii=False, indent=2))
         return
-    loc = "当前分支" if on_branch else "已回退丢弃"
-    print(bold(f"entry {e.get('id', '?')} · {e.get('type', '?')} "
-               f"· {e.get('timestamp', '?')} · {loc}"))
-    if e.get("type") != "message":
-        print(json.dumps(e, ensure_ascii=False, indent=2))
-        return
-    m = e.get("message") or {}
-    role = m.get("role", "?")
-    if role == "assistant":
-        print(f"  stopReason={m.get('stopReason', 'unknown')}")
-        if m.get("errorMessage"):
-            print(f"  errorMessage={m['errorMessage']}")
-    if role == "toolResult":
-        print(dim(f"  toolName={m.get('toolName')} isError={bool(m.get('isError'))}"
-                  + (f" toolCallId={m.get('toolCallId')}" if m.get("toolCallId") else "")))
-    if role == "system":
-        for name, value in (m.get("sections") or {}).items():
-            print(dim(f"── section: {name} ──"))
-            print(value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2))
-        for key in ("toolsAdded", "toolsRemoved"):
-            if key in m:
-                print(dim(f"── {key} ──"))
-                print(json.dumps(m[key], ensure_ascii=False, indent=2))
-    content = m.get("content") or []
-    if isinstance(content, str):
-        print(dim("── text ──"))
-        print(content)
-        return
-    for p in content:
-        pt = p.get("type")
-        if pt == "text":
-            print(dim("── text ──"))
-            print(str(p.get("text", "")))
-        elif pt == "thinking":
-            print(dim("── thinking ──"))
-            print(str(p.get("thinking", "")))
-        elif pt == "toolCall":
-            print(dim(f"── toolCall {p.get('id', '')} {p.get('name', '')} ──"))
-            print(json.dumps(p.get("arguments") or {}, ensure_ascii=False, indent=2))
-        elif pt == "image":
-            print(dim("── image ──"))
+    location = "当前分支" if on_branch else "已回退丢弃"
+    print(bold(f"entry {number if number is not None else '?'} · id={one_line(e.get('id', '?'))} · {location}"))
+    print(dim(clock_label(record_clock(e))))
+    for key, value in e.items():
+        for line in value_lines(value, label=json.dumps(key, ensure_ascii=False)):
+            print(line)
 
 # ── 入口 ─────────────────────────────────────────────────────────────────────
 def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="pi-snap",
-        description="Pi Agent 会话轨迹、执行摘要与分叉导出。默认显示完整对话、工具参数和状态；--trace 展开结果摘要。"
-                    "未记录结果不等于正在执行或用户打断，未落盘的流式进度不可恢复。",
+        description="通用 Pi 会话记录读取、筛选与展示。默认紧凑单行，按序号展开完整记录；不修改源会话。",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="示例:\n"
-               "  pi-snap                          # 列出最近会话\n"
-               "  pi-snap 01a0e2d6                 # 会话轨迹(正文完整)\n"
-               "  pi-snap 01a0e2d6 --trace --since ID1 --before ID2\n"
-               "                                   # 展开一段执行过程 [ID1, ID2)\n"
-               "  pi-snap 01a0e2d6 --all           # 含被回退丢弃的记录\n"
-               "  pi-snap 01a0e2d6 505c6f39        # 看某条记录的完整内容\n"
-               "  pi-snap 01a0e2d6 505c6f39 --json # 该条的原始 JSON\n"
-               "  pi-snap --session-dir /tmp/test-sessions\n"
-               "                                   # 指定会话根目录(测试时 session\n"
-               "                                   # 不在 ~/.pi/agent/sessions 下)")
-    ap.add_argument("session", nargs="?", help="会话头里的 id 前缀(或文件名前缀、jsonl 文件路径)")
-    ap.add_argument("entry", nargs="?", help="记录 id(快照里 [xxxx] 括号中的)")
-    ap.add_argument("--session-dir", metavar="PATH", help="会话根目录，递归查找其下"
-                    " .jsonl(默认 ~/.pi/agent/sessions)")
-    ap.add_argument("--all", action="store_true", help="包含被回退丢弃的分支记录")
-    ap.add_argument("--trace", action="store_true", help="执行视图：包含工具调用、结果、system 与状态摘要")
-    ap.add_argument("--since", metavar="ID", help="从当前分支记录 ID（或唯一前缀）开始，包含该记录")
-    ap.add_argument("--before", metavar="ID", help="在当前分支记录 ID（或唯一前缀）之前结束，不含该记录")
-    ap.add_argument("--tail", type=int, metavar="N", help="过滤后最后 N 条可显示记录（正整数）；同条中的多个工具调用占一条")
+               "  pi-snap SESSION --exclude thinking,image --max-chars 300\n"
+               "  pi-snap SESSION --only user,assistant\n"
+               "  pi-snap SESSION --preset tools --since ID1 --before ID2\n"
+               "  pi-snap SESSION ENTRY --json\n"
+               "  pi-snap SESSION ENTRY --fork ./retry.jsonl\n\n"
+               "类型匹配对象的 type / role / customType，可用 role:user 等限定字段。\n"
+               "筛选递归作用于嵌套对象；排除优先。预设仅提供普通参数默认值。\n"
+               "all: 不筛选；conversation: 只选 user/assistant，排除 thinking/toolCall；\n"
+               "tools: 只选 toolCall/toolResult；trajectory: 对话、调用发起及行为推荐。\n"
+               "序号先于筛选生成，至少4位右对齐。预取使用执行时间，完整时间在详情中查看。输出未经脱敏。")
+    ap.add_argument("session", nargs="?", help="会话头 id / 文件名前缀，或 JSONL 文件路径")
+    ap.add_argument("entry", nargs="?", help="记录序号或原始 ID／唯一前缀；纯数字原始 ID 使用 id: 前缀")
+    ap.add_argument("--session-dir", metavar="PATH", help="会话根目录（默认 ~/.pi/agent/sessions）")
+    ap.add_argument("--all", action="store_true", help="包含其他分支，保持文件顺序")
+    ap.add_argument("--only", action="append", metavar="TYPES", help="只选指定类型，逗号分隔，可重复；替换预设 only")
+    ap.add_argument("--exclude", action="append", metavar="TYPES", help="排除指定类型及其子树，逗号分隔，可重复；追加到预设 exclude")
+    ap.add_argument("--preset", choices=PRESETS, help="普通参数预设（默认 all）；不是独立视图")
+    ap.add_argument("--max-chars", type=int, metavar="N", help="每行正文最多 N 个字符（默认 300）；0 不限，定位列不截断")
+    ap.add_argument("--since", metavar="REF", help="从当前分支记录序号或原始 ID 开始，包含该记录")
+    ap.add_argument("--before", metavar="REF", help="在当前分支记录序号或原始 ID 之前结束，不含该记录")
+    ap.add_argument("--since-time", metavar="ISO", help="事件/执行时间起点（包含）；ISO 8601，必须带时区")
+    ap.add_argument("--before-time", metavar="ISO", help="事件/执行时间终点（不含）；批次内任一事件命中即保留原记录")
+    ap.add_argument("--tail", type=int, metavar="N", help="筛选后最后 N 条原始记录（正整数），不是内容块数")
     ap.add_argument("--json", action="store_true", help="配合 entry: 输出原始 JSON")
     ap.add_argument("--fork", metavar="PATH", help="导出截至 entry(含)的独立 v3 会话；目标必须不存在，不恢复环境")
+    ap.add_argument("--trace", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
 
+    if args.trace:
+        ap.error("--trace 已移除：使用 --preset tools 选择工具记录，或 --exclude thinking,image --max-chars 300 精简输出；不再提供旧摘要视图")
+    display_options = (args.only is not None or args.exclude is not None
+                       or args.preset is not None or args.max_chars is not None)
+    selection_options = (args.tail is not None or args.all
+                         or args.since is not None or args.before is not None
+                         or args.since_time is not None or args.before_time is not None)
     if args.fork is not None:
         if not args.session or not args.entry:
             ap.error("--fork 需要指定 session 和 entry id")
-        if (args.json or args.all or args.tail is not None or args.trace
-                or args.since is not None or args.before is not None):
-            ap.error("--fork 不能与 --json、--all、--tail、--trace、--since 或 --before 一起使用")
-
+        if args.json or display_options or selection_options:
+            ap.error("--fork 不能与 --json、筛选、预设、长度或区间参数一起使用")
     if args.json and not args.entry:
         ap.error("--json 需要指定 entry id")
-    if args.all and not args.session:
-        ap.error("--all 需要指定 session")
-    view_options = (args.trace or args.tail is not None or args.all
-                    or args.since is not None or args.before is not None)
-    if view_options and not args.session:
-        ap.error("视图、区间和 --tail 参数需要指定 session")
-    if args.entry and view_options:
-        ap.error("单条详情不能与视图、区间或 --tail 参数一起使用")
+    if (display_options or selection_options) and not args.session:
+        ap.error("筛选、预设、长度与区间参数需要指定 session")
+    if args.entry and (display_options or selection_options):
+        ap.error("单条详情不能与筛选、预设、长度或区间参数一起使用")
     if args.tail is not None and args.tail <= 0:
         ap.error("--tail 必须是正整数")
+    if args.max_chars is not None and args.max_chars < 0:
+        ap.error("--max-chars 必须是非负整数（0 表示不限）")
     if args.all and (args.since is not None or args.before is not None):
         ap.error("--all 不能与 --since 或 --before 混用，避免跨分支区间")
+    since_time, before_time = None, None
+    if args.since_time is not None:
+        since_time = parse_ts(args.since_time)
+        if since_time is None:
+            ap.error("--since-time 需要带时区的 ISO 8601 时间，例如 2026-10-13T08:00:00+08:00")
+    if args.before_time is not None:
+        before_time = parse_ts(args.before_time)
+        if before_time is None:
+            ap.error("--before-time 需要带时区的 ISO 8601 时间，例如 2026-10-13T08:05:00+08:00")
+    if since_time is not None and before_time is not None and since_time > before_time:
+        ap.error("--since-time 起点在 --before-time 终点之后")
+    try:
+        options = resolve_options(args.preset or "all", args.only, args.exclude, args.max_chars)
+    except ValueError as exc:
+        ap.error(str(exc))
 
     sessions_dir = (os.path.expanduser(args.session_dir)
                     if args.session_dir else DEFAULT_SESSIONS_DIR)
@@ -1042,14 +909,16 @@ def main(argv=None):
 
     if args.entry:
         chain, _ = active_branch(entries)
-        on_branch = {c.get("id") for c in chain}
+        on_branch = {id(c) for c in chain}
         e = find_entry(entries, args.entry)
-        render_entry_full(e, e.get("id") in on_branch, args.json)
+        render_entry_full(e, id(e) in on_branch
+                          or (e is entries[0] and e.get("type") == "session"), args.json,
+                          next(i for i, entry in enumerate(entries, 1) if entry is e))
         return
 
     render_snapshot(entries, path, show_all=args.all, tail=args.tail,
-                    sessions_dir=sessions_dir, selector=args.session,
-                    trace=args.trace, since=args.since, before=args.before)
+                    since=args.since, before=args.before, options=options,
+                    since_time=since_time, before_time=before_time)
 
 if __name__ == "__main__":
     main()

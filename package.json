@@ -1,7 +1,7 @@
 {
-  "version": "0.3.3",
+  "version": "0.4.0",
   "type": "module",
-  "description": "Compact Pi session snapshots for humans and agents",
+  "description": "Read, filter, and display Pi session records; export session forks",
   "scripts": {
     "test": "node --test test/*.test.mjs && bash test/snap.sh"
   },

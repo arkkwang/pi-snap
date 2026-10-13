@@ -1,180 +1,133 @@
-"""Snapshot limits, system summaries and branch-local tool inventories."""
+"""Generic structural filtering/rendering regressions (replaces tool templates)."""
 import contextlib
+import copy
 import io
-import runpy
 from pathlib import Path
+import runpy
+import unittest
 
 api = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'snap.py'))
 
 
-def entry(id, parent=None, **message):
-    return dict(type='message', id=id, parentId=parent, message=message)
+def select(record, only=None, exclude=None):
+    options = api['resolve_options'](only=only, exclude=exclude)
+    return api['filter_record'](record, options['only'], options['exclude'])
 
 
-def render(e):
-    return '\n'.join(api['render_message'](e, '', None, {}, set()))
+class StructureTests(unittest.TestCase):
+    def setUp(self):
+        self.record = dict(type='message', id='outer', parentId=None, timestamp='source time',
+                           envelopeExtra='UNRELATED ENVELOPE', message=dict(
+            role='assistant', timestamp=123, usage={'tokens': 100}, content=[
+                dict(type='thinking', thinking='THOUGHT'),
+                dict(type='text', text='TEXT'),
+                dict(type='toolCall', id='tc', name='unknown-tool', arguments={
+                    'payload': 'PRESERVE', 'raw': [None, False, 0, '', [], {}],
+                    'nested': {'customType': 'vendor:event', 'value': 'CUSTOM'}}),
+                dict(type='future-block', value='FUTURE')]))
+
+    def test_no_filter_preserves_every_field_and_raw_value(self):
+        self.assertEqual(select(self.record), self.record)
+        for value in (None, False, 0, '', [], {}, [None, False, 0, '', [], {}]):
+            with self.subTest(value=value):
+                record = dict(type='future-event', role='future-role', payload=value)
+                self.assertEqual(select(record), record)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            api['render_entry_full'](self.record, True, False)
+        for token in ('THOUGHT', 'FUTURE', 'PRESERVE', 'usage', 'UNRELATED ENVELOPE',
+                      'null', 'false', '0', '""', '[]', '{}', 'unknown-tool'):
+            self.assertIn(token, out.getvalue())
+
+    def test_only_descendant_retains_path_and_context_not_sibling_payload(self):
+        expected = {key: self.record[key] for key in ('type', 'id', 'parentId', 'timestamp')}
+        expected['message'] = dict(role='assistant', timestamp=123,
+                                   content=[self.record['message']['content'][2]])
+        self.assertEqual(select(self.record, ['toolCall']), expected)
+        self.assertEqual(select(self.record, ['type:toolCall']), expected)
+        nested = select(self.record, ['customType:vendor:event'])
+        call = nested['message']['content'][0]
+        self.assertEqual(call, dict(type='toolCall', id='tc', arguments={
+            'nested': {'customType': 'vendor:event', 'value': 'CUSTOM'}}))
+        self.assertNotIn('envelopeExtra', nested)
+        self.assertNotIn('usage', nested['message'])
+
+    def test_include_opens_subtree_exclude_wins_at_any_depth(self):
+        projected = select(self.record, ['role:assistant'], ['thinking,customType:vendor:event'])
+        self.assertEqual(projected['message']['usage'], {'tokens': 100})
+        parts = projected['message']['content']
+        self.assertEqual([part['type'] for part in parts], ['text', 'toolCall', 'future-block'])
+        self.assertNotIn('nested', parts[1]['arguments'])
+        self.assertEqual(parts[1]['arguments']['raw'], [None, False, 0, '', [], {}])
+        self.assertIs(select(self.record, ['toolCall'], ['role:assistant']), api['OMIT'])
+        self.assertIs(select(self.record, ['message'], ['message']), api['OMIT'])
+        # Exclusion-only preserves surrounding data, including empty containers.
+        projected = select(self.record, exclude=['thinking,text,toolCall,future-block'])
+        self.assertEqual(projected['message']['content'], [])
+        self.assertEqual(projected['envelopeExtra'], 'UNRELATED ENVELOPE')
+
+    def test_matching_is_exact_case_sensitive_string_tag_only(self):
+        rows = [dict(type='wanted', value=1), dict(role='wanted', value=2),
+                dict(customType='wanted', value=3), dict(type='Wanted', value=4),
+                dict(type='wanted-more', value=5), dict(type=['wanted'], value=6),
+                dict(type=1, value=7), dict(name='wanted', value=8)]
+        self.assertEqual(select({'rows': rows}, ['wanted']), {'rows': rows[:3]})
+        for field, index in [('type', 0), ('role', 1), ('customType', 2)]:
+            self.assertEqual(select({'rows': rows}, [field + ':wanted']), {'rows': [rows[index]]})
+        self.assertIs(select({'rows': rows}, ['1']), api['OMIT'])
+        self.assertIs(select({'rows': rows}, ['want']), api['OMIT'])
+
+    def test_repeated_comma_selectors_and_no_mutation(self):
+        original = copy.deepcopy(self.record)
+        projected = select(self.record, [' thinking , type:text', 'type:future-block'])
+        self.assertEqual([p['type'] for p in projected['message']['content']],
+                         ['thinking', 'text', 'future-block'])
+        select(self.record, exclude=['thinking', 'toolCall,text'])
+        self.assertEqual(self.record, original)
+        for bad in ('', 'a,', ',a', 'a,,b', 'name:tool', 'type:', ':value'):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                api['parse_selectors']([bad])
+
+    def test_presets_are_only_configuration_and_overrides_compose(self):
+        self.assertEqual(set(api['PRESETS']), {'all', 'conversation', 'tools', 'trajectory'})
+        for name, base in api['PRESETS'].items():
+            with self.subTest(preset=name):
+                self.assertEqual(set(base), {'only', 'exclude', 'max_chars'})
+                self.assertEqual(base['max_chars'], 300)
+                self.assertEqual(api['resolve_options'](name), api['resolve_options'](
+                    only=base['only'], exclude=base['exclude'], max_chars=base['max_chars']))
+        opts = api['resolve_options']('conversation', ['customType:new'], ['type:image'], 7)
+        self.assertEqual(opts['only'], (('customType', 'new'),))
+        self.assertEqual(opts['exclude'], (('type', 'thinking'), ('type', 'toolCall'), ('type', 'image')))
+        self.assertEqual(opts['max_chars'], 7)
+        # Prove max_chars defaults are configuration, not hard-coded preset branches.
+        api['PRESETS']['all']['max_chars'] = 9
+        try:
+            self.assertEqual(api['resolve_options']()['max_chars'], 9)
+            self.assertEqual(api['resolve_options'](max_chars=0)['max_chars'], 0)
+        finally:
+            api['PRESETS']['all']['max_chars'] = 300
+
+    def test_full_detail_keeps_strings_and_all_metadata(self):
+        record = dict(type='future-event', id='long-navigation-id', long_field_name='中文' * 1000,
+                      second='uvwxyz', number=123456, boolean=False, null=None,
+                      message=dict(role='assistant', usage={'input': 10}, textSignature='SIGNATURE'))
+        original = copy.deepcopy(record)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            api['render_entry_full'](record, True, False)
+        for token in ('中文' * 1000, 'long_field_name', '123456', 'false', 'null', 'SIGNATURE', 'usage'):
+            self.assertIn(token, out.getvalue())
+        self.assertEqual(record, original)
+
+    def test_multiline_and_control_characters_are_not_terminal_commands(self):
+        out = '\n'.join(api['value_lines']({'text': 'first\n\nlast\t\x1b[31m\r'}))
+        self.assertIn('"text": |\n', out)
+        self.assertIn('first\n', out)
+        self.assertIn('last\\t\\u001b[31m\\r', out)
+        self.assertNotIn('\x1b', out)
+        self.assertNotIn('\r', out)
 
 
-def call(name, text):
-    args = {'command': text} if name == 'bash' else {'query': text}
-    return entry('call', role='assistant', content=[
-        dict(type='toolCall', id='tc', name=name, arguments=args)])
-
-
-for size in (599, 600, 601):
-    out = render(call('bash', 'x' * size))
-    assert ('…(+' in out) == (size > 600), out
-    if size > 600:
-        assert 'x' * 600 + ' …(+1c)' in out
-assert '…(+' in render(call('search', 'x' * 200))
-# Configuration alone changes limits, including tools with no special renderer.
-api['TOOL_SUMMARIES']['bash']['max_chars'] = 400
-api['TOOL_SUMMARIES']['search'] = {'max_chars': 600}
-assert 'x' * 400 + ' …(+1c)' in render(call('bash', 'x' * 401))
-assert '…(+' not in render(call('search', 'x' * 200))
-api['TOOL_SUMMARIES']['bash']['max_chars'] = 600
-
-# Selection, composition, derived values and conditional segments are all configured.
-fmt = api['fmt_call_args']
-for name, args, expected in [
-    ('bash', {'command': 'echo   hi\nthere', 'timeout': 30}, 'echo hi there'),
-    ('bash', {}, ''),
-    ('read', {'path': '/a'}, '/a'),
-    ('read', {'path': '/a', 'offset': 0}, '/a @0+?'),
-    ('read', {'path': '/a', 'limit': 50}, '/a @?+50'),
-    ('read', {'path': '/a', 'offset': None, 'limit': None}, '/a'),
-    ('read', {'path': '/a', 'offset': None, 'limit': 50}, '/a @?+50'),
-    ('read', {'path': '/a', 'offset': 0, 'limit': None}, '/a @0+?'),
-    ('read', {'path': '/a', 'offset': None}, '/a'),
-    ('ls', {'path': '/a'}, '/a'),
-    ('write', {'path': '/a', 'content': '字' * 1200}, '/a · 1.2Kc'),
-    ('write', {'path': '/a', 'content': None}, '/a · 0c'),
-    ('edit', {'path': '/a', 'edits': [{}, {}]}, '/a · 2 处修改'),
-    ('edit', {'path': '/a'}, '/a · 0 处修改'),
-    ('grep', {'pattern': '字.*', 'path': '/a'}, '字.* · /a'),
-    ('find', {'pattern': '*.md', 'path': '/a'}, '*.md · /a'),
-    ('unknown', {'query': '字'}, '{"query": "字"}'),
-    ('unknown', None, 'null'),
-    ('unknown', ['字', 1], '["字", 1]'),
-    ('unknown', 'partial  arguments', 'partial arguments'),
-    ('bash', 'partial  arguments', 'partial arguments'),
-]:
-    assert fmt(name, args) == expected, (name, fmt(name, args), expected)
-api['TOOL_SUMMARIES']['search'] = {
-    'max_chars': 400,
-    'template': '{query} · {tags:count}',
-    'optional': [{'when_any': ('path',), 'template': ' in {path}'}],
-}
-assert fmt('search', {'query': 'find me', 'tags': ['a', 'b']}) == 'find me · 2'
-assert fmt('search', {'query': 'find me', 'path': '/a'}) == 'find me · 0 in /a'
-assert 'x' * 400 + ' …(+5c)' in render(call('search', 'x' * 401))
-# Restore config to keep following checks independent.
-del api['TOOL_SUMMARIES']['search']
-# Middle truncation is display-only and independent of the host path syntax.
-for path in [
-    '/Users/name/' + 'directory/' * 25 + '笔记.md',
-    'C:\\Users\\name\\' + 'directory\\' * 25 + 'notes.md',
-    '//server/share/' + 'directory/' * 25 + 'notes.md',
-    '~/my project/' + 'directory/' * 25 + 'notes.md',
-]:
-    for name, extra, suffix in [
-        ('read', {'offset': 0, 'limit': 50}, ' @0+50'),
-        ('write', {'content': 'hello'}, ' · 5c'),
-        ('edit', {'edits': [{}]}, ' · 1 处修改'),
-        ('ls', {}, ''),
-    ]:
-        e = entry('path', role='assistant', content=[dict(
-            type='toolCall', id='tc', name=name, arguments={'path': path, **extra})])
-        out = render(e)
-        full = fmt(name, {'path': path, **extra})
-        assert full[:40] in out and full[-80:] in out, out
-        assert f'…(+{len(full) - 120}c)' in out, out
-        assert path not in out
-        assert suffix in out
-assert api['trunc']('abcdef', 3, 'middle') == 'a …(+3c) ef'
-assert api['trunc']('abc', 3, 'middle') == 'abc'
-assert api['trunc']('abc', 1, 'middle') == ' …(+2c) c'
-assert api['trunc']('abc', 0, 'middle') == ' …(+3c)'
-# Extremely long filenames still retain their extension; full details are untouched.
-assert api['trunc']('/a/' + 'x' * 200 + '.md', 120, 'middle').endswith('.md')
-for role, limit in [('user', 800), ('assistant', 600)]:
-    out = render(entry('text', role=role, content=[dict(type='text', text='字' * (limit + 1))]))
-    assert '字' * limit + ' …(+1c)' in out
-out = render(entry('result', role='toolResult', toolName='bash',
-                   content=[dict(type='text', text='x' * 101)]))
-assert 'x' * 100 + ' …(+1c)' in out
-
-# Unconfigured results keep the default metadata, error status, duration and images.
-def result(name, text, error=False):
-    return entry('result', role='toolResult', toolName=name, isError=error,
-                 toolCallId='tc', content=[dict(type='text', text=text), dict(type='image')])
-
-out = render(result('unknown', '字' * 101))
-assert '[← unknown] ok 101c' in out and '字' * 100 + ' …(+1c)' in out and '[image]' in out
-assert 'ERR 101c' in render(result('unknown', '字' * 101, True))
-r = result('unknown', 'hello')
-r['timestamp'] = '2026-10-09T00:00:02Z'
-out = '\n'.join(api['render_message'](r, '', None, {'tc': api['parse_ts']('2026-10-09T00:00:00Z')}, set()))
-assert 'ok 5c 2s' in out
-assert 'line1' not in render(result('read', 'line1\nline2'))
-assert 'ok 2 lines 11c' in render(result('read', 'line1\nline2'))
-assert 'line1' in render(result('read', 'line1\nline2', True))
-for text, lines in [('', 0), ('a', 1), ('a\n', 1), ('a\nb', 2),
-                    ('a\nb\n', 2), ('\n', 1), ('a\n\n', 2), ('a\r\nb\r\n', 2)]:
-    assert f'ok {lines} lines ' in render(result('read', text)), (repr(text), lines)
-api['TOOL_SUMMARIES']['custom'] = {'result': {
-    'template': '{status} {lines} rows {size}{duration}',
-    'preview_chars': 3,
-    'error_preview_chars': 5,
-}}
-assert 'ok 1 rows 6c  abc …(+3c)' in render(result('custom', 'abcdef'))
-assert 'ERR 1 rows 6c  abcde …(+1c)' in render(result('custom', 'abcdef', True))
-assert fmt('custom', {'key': 'value'}) == '{"key": "value"}'
-api['TOOL_SUMMARIES']['custom']['result']['preview_chars'] = 0
-assert 'abcdef' not in render(result('custom', 'abcdef'))
-assert ' …(+' not in render(result('custom', 'abcdef'))
-assert '[image]' in render(result('custom', ''))
-del api['TOOL_SUMMARIES']['custom']
-
-sections = dict(cwd='<cwd>\n/path with spaces/项目\n</cwd>',
-                skills='<available_skills><skill>one</skill><skill>two</skill></available_skills>',
-                mcp_servers='<mcp_servers>\n- mcp__exa (tool_search): search\n- mcp__browser (tool_search): browse\n</mcp_servers>',
-                project_context='<project_instructions path="rules">SECRET</project_instructions>')
-s1 = entry('s1', role='system', sections=sections, toolsAdded=[{'name': 'bash'}, {'name': 'read'}])
-a = entry('a', 's1', role='assistant', content=[])
-s2 = entry('s2', 'a', role='system', toolsAdded=[{'name': 'edit'}], toolsRemoved=['read'])
-s3 = entry('s3', 'a', role='system', toolsAdded=[{'name': 'write'}])
-s4 = entry('s4', 's3', role='system', toolsRemoved=['bash'])
-# Real Pi sessions persist removals as full tool objects, not bare names.
-s5 = entry('s5', 's4', role='system', toolsRemoved=[{'name': 'write', 'description': 'write files'}])
-
-
-def snapshot(entries, all=False, tail=None):
-    out = io.StringIO()
-    with contextlib.redirect_stdout(out):
-        api['render_snapshot'](entries, 'fixture', all, tail, trace=True)
-    return out.getvalue()
-
-
-entries = [s1, a, s2, s3, s4, s5]
-out = snapshot(entries, all=True)
-assert 'cwd=/path with spaces/项目 · Skills=2 · MCP=2 · Tools=2 · Instructions=1' in out
-assert 'SECRET' not in out
-assert '~[s2] [system]  Tools=2(+1/-1)' in out
-assert '[s3] [system]  Tools=3(+1)' in out
-assert '[s4] [system]  Tools=2(-1)' in out
-assert '[s5] [system]  Tools=1(-1)' in out
-assert len([line for line in out.splitlines() if '[system]' in line]) == 5
-out = snapshot(entries, tail=1)
-assert '[s1]' not in out and '[s5] [system]  Tools=1(-1)' in out
-assert '~[s2]' not in snapshot(entries)
-assert 'Tools=?(-1)' in render(entry('unknown', role='system', toolsRemoved=['bash']))
-assert 'sections=custom' in render(entry('custom', role='system', sections={'custom': 'SECRET'}))
-assert 'Prompt=3c' in render(entry('plain', role='system', content='abc'))
-assert 'Prompt=5c' in render(entry('combined', role='system',
-    sections={'preamble': '中文'}, content=[dict(type='text', text='abc')],
-    toolsAdded=[{'name': 'tool', 'description': 'not counted' * 100}]))
-assert 'Prompt=1.2Kc' in render(entry('large', role='system', sections={'preamble': '字' * 1200}))
-assert f'Prompt={api["fmt_size"](sum(map(len, sections.values())))}' in snapshot(entries)
-assert '(empty)' in render(entry('empty', role='system'))
-print('PASS: input and result templates / configurable limits / unknown tools / one-line system / branch-local tools / tail')
+if __name__ == '__main__':
+    unittest.main()

@@ -69,6 +69,26 @@ class ForkTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(snap.load_entries(self.output)[1:], self.entries[1:7])
 
+    def test_source_number_and_numeric_id_fork(self):
+        result = self.run_cli('9')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(snap.load_entries(self.output)[1:], self.entries[1:6] + self.entries[7:9])
+        self.output.unlink()
+        # Integer selectors are source positions, while id: preserves numeric IDs.
+        self.entries.append(message('3', 'future', 'user', 'numeric id record'))
+        self.save()
+        result = self.run_cli('id:3')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(snap.load_entries(self.output)[-1], self.entries[-1])
+        self.output.unlink()
+        result = self.run_cli('3')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(snap.load_entries(self.output)[-1], self.entries[2])
+        self.output.unlink()
+        for bad in ('0', '1', '99'):
+            self.assertNotEqual(self.run_cli(bad).returncode, 0)
+            self.assertFalse(self.output.exists())
+
     def test_incomplete_tools_rejected(self):
         for entry in ("call", "result1"):
             with self.subTest(entry=entry):

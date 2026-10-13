@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# pi-snap 回归: 列表 / 快照精简规则 / 分支标记 / 单条完整视图 / 错误处理。
+# pi-snap 回归: 列表 / 通用结构快照 / 分支标记 / 单条完整视图 / 错误处理。
 # Run: bash test/snap.sh
 # fixture 会话目录用 --session-dir 指给脚本(Windows Python 的 expanduser
 # 不认 HOME，不能靠 HOME 覆盖)。
@@ -46,29 +46,35 @@ grep -q "2 个会话" <<<"$out" || fail "list: 会话数不对"
 grep -q "看这个文件" <<<"$out" || fail "list: 缺第一会话预览"
 grep -q "aaa11111" <<<"$out" || fail "list: 缺会话 id"
 
-# ── 快照: 头部 + 精简规则 ────────────────────────────────────────────────────
-out="$(run aaa11111 --trace)"
-grep -q "session $S1" <<<"$out" || fail "snap: 头部 id 错"
-grep -q "model anthropic/test-model" <<<"$out" || fail "snap: 头部模型缺"
-grep -q "内部思考不应出现" <<<"$out" && fail "snap: thinking 不应出现"
-grep -q "被回退的消息" <<<"$out" && fail "snap: 回退分支不应出现"
-grep -q "改用 bash 跑一下" <<<"$out" || fail "snap: 当前分支 user 消息缺"
-grep -q "read.*/tmp/a.py @10+50" <<<"$out" || fail "snap: read 调用参数应含路径和范围"
-grep -q "r1000001.*\[← read\] ok 3 lines" <<<"$out" || fail "snap: read 结果应只报行数"
-grep -q "line1" <<<"$out" && fail "snap: read 结果不应透内容"
-grep -q "r2000001.*ERR.*cat: /tmp/a.py: No such" <<<"$out" || fail "snap: bash ERR 应带开头内容"
-grep -q "✦ compact" <<<"$out" || fail "snap: compaction 行缺"
-grep -q "跳过 1 行" <<<"$out" || fail "snap: 坏尾行应提示跳过"
-grep -q "1 条被回退丢弃" <<<"$out" || fail "snap: 底部应提示回退数量"
+# ── 默认快照: 原始字段、正文与 header 均保留，只有旁支不显示 ──────────────
+out="$(run aaa11111)"
+for expected in "session $S1" 'provider=anthropic' 'modelId=test-model' \
+    '内部思考不应出现' '改用 bash 跑一下' 'path=/tmp/a.py' 'offset=10' \
+    'limit=50' 'line1' 'line3' 'cat: /tmp/a.py: No such' '[  10]' \
+    '读文件然后跑 bash' '跳过 1 行'; do
+    grep -Fq "$expected" <<<"$out" || fail "snap: 缺 $expected"
+done
+grep -q '被回退的消息' <<<"$out" && fail 'snap: 回退分支不应出现'
+
+# 显式筛选才精简；--trace 不再悄悄选择旧 renderer。
+out="$(run aaa11111 --exclude thinking,role:toolResult)"
+grep -q '内部思考不应出现\|line1\|No such file' <<<"$out" && fail 'exclude: 排除子树仍出现'
+grep -q 'path=/tmp/a.py' <<<"$out" || fail 'exclude: 无关调用应保留'
+set +e; out="$(run aaa11111 --trace)"; code=$?; set -e
+[[ $code == 2 ]] || fail "--trace 应退出 2 (实际 $code)"
+grep -q -- '--preset tools' <<<"$out" || fail '--trace: 缺迁移提示'
 
 # ── --all: 回退条目带 ~ 标记 ────────────────────────────────────────────────
 out="$(run aaa11111 --all)"
-grep -q "~\[u200000a\].*\[user\].*被回退的消息" <<<"$out" || fail "--all: 回退条目应带 ~ 标记"
+grep -q '~\[   6\].*\[user\]' <<<"$out" || fail '--all: 回退条目应带 ~ 标记'
+grep -q '被回退的消息' <<<"$out" || fail '--all: 回退条目正文缺失'
 
-# ── --tail ──────────────────────────────────────────────────────────────────
-out="$(run aaa11111 --trace --tail 2)"
-grep -q "看这个文件" <<<"$out" && fail "--tail: 早于尾部的不应出现"
-grep -q "✦ compact" <<<"$out" || fail "--tail: 尾部 compact 缺"
+# ── --tail 按原始记录计数 ──────────────────────────────────────────────────
+out="$(run aaa11111 --tail 2)"
+grep -q '看这个文件' <<<"$out" && fail '--tail: 早于尾部的不应出现'
+grep -q '\[  10\]' <<<"$out" || fail '--tail: 尾部 compact 缺'
+grep -q '\[   9\]' <<<"$out" || fail '--tail: 工具结果计数不应被隐藏'
+grep -q '显示 .*条记录\|省略前\|看某条完整内容\|条被回退丢弃' <<<"$out" && fail '--tail: 不应出现旧统计/footer'
 
 # ── 单条完整视图: 被截断的原文全量 ──────────────────────────────────────────
 out="$(run aaa11111 r1000001)"
@@ -110,66 +116,7 @@ $snap --session-dir "$work/deep" eee55555 2>/dev/null | grep -q "session eee5555
 # 指定目录里找不到主 fixture 的会话
 $snap --session-dir "$work/alt-sessions" aaa11111 >/dev/null 2>&1     && fail "--session-dir: 不应找到其他目录里的会话"
 
-# 中断状态、部分响应与缺失结果；直接调用渲染函数，避免 shell 拼 JSON。
-python3 - "${snap%/*}/snap.py" <<'PY'
-import contextlib
-import io
-import runpy
-import sys
-
-api = runpy.run_path(sys.argv[1])
-def capture(fn, *args):
-    out = io.StringIO()
-    with contextlib.redirect_stdout(out):
-        api[fn](*args, **({'trace': True} if fn == 'render_snapshot' else {}))
-    return out.getvalue()
-
-def entry(id, parent, message, second=1):
-    return dict(type='message', id=id, parentId=parent,
-                timestamp=f'2026-09-27T10:00:{second:02d}.000Z', message=message)
-
-call = dict(type='toolCall', id='call1', name='read', arguments={'path': '/partial'})
-for parts, stage in [([], '未保存响应内容'),
-                     ([dict(type='thinking', thinking='')], '仅空块，无正文'),
-                     ([dict(type='thinking', thinking='不在快照透出')], '思考'),
-                     ([dict(type='text', text='半句话')], '文字'),
-                     ([call], '工具请求')]:
-    e = entry('abort', None, dict(role='assistant', stopReason='aborted',
-                                 errorMessage='Operation aborted', content=parts))
-    # render_message 返回行数组，使用 join 验证
-    lines = api['render_message'](e, '', None, {}, set())
-    text = '\n'.join(lines)
-    assert '[status]' in text and stage in text and 'Operation aborted' in text
-    assert '不在快照透出' not in text
-    if parts == [call]:
-        assert '参数可能不完整' in text and '未记录结果' in text
-        assert '[assistant]' not in text
-    full = capture('render_entry_full', e, True, False)
-    assert 'stopReason=aborted' in full and 'Operation aborted' in full
-
-for reason, label in [('error', '响应失败'), ('length', '长度限制')]:
-    e = entry('fail', None, dict(role='assistant', stopReason=reason, content=[]))
-    assert label in '\n'.join(api['render_message'](e, '', None, {}, set()))
-
-root = dict(type='session', id='session', cwd='/test', timestamp='2026-09-27T10:00:00Z')
-a = entry('a', None, dict(role='assistant', stopReason='toolUse', content=[call]))
-r = entry('r', 'a', dict(role='toolResult', toolName='read', toolCallId='call1',
-                        isError=True, content=[dict(type='text', text='Operation aborted')]), 3)
-u = entry('u', 'a', dict(role='user', content=[dict(type='text', text='继续')]), 4)
-# 正常 call + 缺结果只能报未知，不能声称正在执行或用户取消。
-out = capture('render_snapshot', [root, a], 'fixture', False, None)
-assert '是否开始执行未知' in out and '[status]' not in out
-# 有工具错误结果则展示错误；--tail 不影响配对，旧分支的结果不算当前分支结果。
-out = capture('render_snapshot', [root, a, r], 'fixture', False, None)
-assert '未记录结果' not in out and 'ERR' in out and 'Operation aborted' in out
-out = capture('render_snapshot', [root, a, r], 'fixture', False, 1)
-assert 'Operation aborted' in out and '[→ read]' not in out
-out = capture('render_snapshot', [root, a, r, u], 'fixture', False, None)
-assert '未记录结果' in out and 'Operation aborted' not in out
-out = capture('render_snapshot', [root, a, r, u], 'fixture', True, None)
-assert '未记录结果' not in out and 'Operation aborted' in out
-print('PASS: interruption / partial response / missing result / branch / tail')
-PY
+# 中断/空块/原始状态由 dialogue.py 覆盖，不再推断执行状态。
 
 # ── Run 目录布局: 每个 Run 一个 session.jsonl(文件名不含 id) ────────────────
 # 目录名含空格: 复制出来的命令必须引用正确。
@@ -221,17 +168,11 @@ hdr_cmd="$(grep -o "pi-snap --session-dir '[^']*'" <<<"$out" | head -1)"
     || fail "列表: 含空格的自定义 root 未被引用(得到 $hdr_cmd)"
 eval "$hdr_cmd ${B2:0:12}" >/dev/null 2>&1 || fail "列表: 复制出的命令跑不通"
 
-# 底部查看命令: 同样带上自定义 root(含空格引用), 复制后能跑
+# 快照不再附带 footer；按显示序号直接定位，路径有空格仍可用。
 out="$(bstat "${B2:0:12}" 2>/dev/null)"
-grep -q -- "--session-dir" <<<"$out" || fail "快照: 底部查看命令缺 --session-dir"
-foot="$(grep -o "看某条完整内容: .* <entry-id>" <<<"$out" | sed 's/^看某条完整内容: //; s/ <entry-id>$//')"
-[[ "$foot" == *"--session-dir '"*"all runs/sessions'"* ]] \
-    || fail "快照: 底部命令未引用含空格的 root(得到 $foot)"
-eval "$foot u1" >/dev/null 2>&1 || fail "快照: 复制出的查看命令跑不通"
-# 用路径打开时, 底部命令跟着用路径(重复 id 用前缀分不开)
-out="$(bstat "$batch/bookmark-v2-run-001-copy/session.jsonl" 2>/dev/null)"
-foot="$(grep -o "看某条完整内容: .* <entry-id>" <<<"$out" | sed 's/^看某条完整内容: //; s/ <entry-id>$//')"
-eval "$foot u1" >/dev/null 2>&1 || fail "快照: 路径打开时底部命令跑不通"
+grep -q '看某条完整内容\|省略前\|条被回退丢弃' <<<"$out" && fail '快照: 不应出现旧 footer'
+out="$(bstat "$batch/bookmark-v2-run-001-copy/session.jsonl" 2 --json 2>/dev/null)"
+python3 -c 'import json,sys; assert json.load(sys.stdin)["id"] == "u1"' <<<"$out"     || fail '快照: 含空格路径 + 序号详情应可用'
 
 # 重复头部 id: 歧义提示必须给出路径, 用户才能区分
 set +e; out="$(bstat 01a114ba 2>&1)"; code=$?; set -e
@@ -419,7 +360,7 @@ PY
 printf 'PASS: list / snapshot / --all / --tail / entry view / errors / custom dir\n'
 printf 'PASS: run-dir layout / header-id lookup / ambiguity paths / copy cmds\n'
 
-# ── system: 分区快照可发现，详情保留原文与工具变更 ─────────────────────────
+# ── system: 默认和详情均保留原文与工具变更 ─────────────────────────
 system_file="$work/system.jsonl"
 python3 - "$system_file" <<'PYFIX'
 import json, sys
@@ -438,11 +379,12 @@ with open(sys.argv[1], "w", encoding="utf-8") as f:
     for e in entries:
         f.write(json.dumps(e, ensure_ascii=False) + "\n")
 PYFIX
-out="$(run "$system_file" --trace)"
-grep -q 'sys1.*\[system\].*Tools=1.*Instructions=0' <<<"$out" || fail "system: 缺环境/工具摘要"
-grep -q 'sys2.*\[system\].*Tools=0(-1)' <<<"$out" || fail "system: 缺移除摘要"
-grep -q 'sys3.*\[system\]' <<<"$out" || fail "system: 缺文本块摘要"
-grep -q 'SYSTEM-SECRET' <<<"$out" && fail "system: 快照不应展开正文"
+out="$(run "$system_file")"
+for expected in '[   2]' '[   3]' '[   4]' 'toolsAdded' 'toolsRemoved' 'SYSTEM-SECRET正文' '直接字符串正文' '文本块正文'; do
+    grep -Fq "$expected" <<<"$out" || fail "system: 默认缺 $expected"
+done
+out="$(run "$system_file" --exclude role:system)"
+grep -q 'SYSTEM-SECRET\|toolsAdded\|toolsRemoved' <<<"$out" && fail 'system: 显式排除应删除整个消息子树'
 out="$(run "$system_file" sys1)"
 for expected in 'preamble' 'SYSTEM-SECRET正文' '项目规则' '第二行' 'toolsAdded' '通知定义' 'parameters'; do
     grep -q "$expected" <<<"$out" || fail "system detail: 缺 $expected"
@@ -454,7 +396,7 @@ out="$(run "$system_file" sys3)"
 grep -q '文本块正文' <<<"$out" || fail "system detail: 文本块缺失"
 out="$(run "$system_file" sys1 --json)"
 grep -q 'sections' <<<"$out" || fail "system json: 原始分区缺失"
-printf 'PASS: system summary / sections / tool changes / string and block content / raw JSON\n'
+printf 'PASS: generic system fields / sections / tool changes / string and block content / raw JSON\n'
 python3 "$root/test/summary.py"
 python3 "$root/test/fork.py"
 
