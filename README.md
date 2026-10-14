@@ -4,12 +4,12 @@ English | [简体中文](README.zh-CN.md)
 
 **Read, filter, and display Pi session records** for humans and agents. Scan conversations and execution paths as compact single lines, open full evidence by record number, or export an independent session through a selected record.
 
-The original JSON is preserved. New types, content blocks, and fields have a generic fallback instead of requiring individual adapters. Filters select content; one renderer presents it; presets are just option bundles. No model calls or changes to source sessions.
+The original JSON is preserved. New types, content blocks, and fields have a generic fallback instead of requiring individual adapters. Filters select content; one renderer presents it; views are just option bundles. No model calls or changes to source sessions.
 
 ```text
-[   2] 12:05:23 [user] Check this file
-[ 128] 12:05:25 [→ read] path=/project/file.py, offset=10
-[ 132] 12:05:26 [assistant] Check complete.
+[   2] 12:05:23 [type:message > role:user > type:text] Check this file
+[ 128] 12:05:25 [type:message > role:assistant > type:toolCall] → read path=/project/file.py, offset=10
+[ 132] 12:05:26 [type:message > role:assistant > type:text] Check complete.
 ```
 
 ## Install and use
@@ -19,10 +19,13 @@ Requires Python 3.10+. The npm launcher also requires Node.js 22.19+ and does no
 ```bash
 npm install -g @arkkwang/pi-snap
 pi-snap                              # List recent sessions
-pi-snap SESSION                      # Single-line records on the current branch
-pi-snap SESSION --preset trajectory  # Dialogue, call requests, recommendations and warnings
+pi-snap --list-views                 # Show both views and their defaults
+pi-snap SESSION --view story         # Read the dialogue mainline, full-length bodies
+pi-snap SESSION --view trace         # Dialogue, call requests, recommendations
+pi-snap SESSION --list-types         # Actual tag paths + copyable selectors
+pi-snap SESSION                      # Full compact display (no view)
 pi-snap SESSION --only user,assistant --exclude thinking,image
-pi-snap SESSION --preset tools --max-chars 500 --tail 20
+pi-snap SESSION --view trace --max-chars 500 --tail 20
 pi-snap SESSION 128                  # Complete individual record
 pi-snap SESSION 128 --json           # Original JSON
 ```
@@ -33,25 +36,40 @@ pi-snap SESSION 128 --json           # Original JSON
 
 - Valid source records are numbered from 1, including the session header, before branch/range/filter selection. Filtering and `--tail` do not renumber them. Appending records preserves existing numbers; editing old records can change them.
 - Numbers are right-aligned and space-padded to at least four digits. The whole column grows beyond 9,999 records, based on the complete file. Original IDs remain in details.
+- Each row shows `[number] time [tag chain] body`. The tag chain is the real source nesting of qualified tags, e.g. `type:message > role:assistant > type:toolCall`; several tags on the same node are all kept (`type:custom_message+customType:capability-prefetch`). Tool names live in the body: `→ read …` starts a call, `← read …` a result. Nested preparation rows keep their host record tags — they never masquerade as top-level assistant messages. Rows without any tags fall back to `record`.
 - Text blocks and calls produce separate lines with the same source number. Filtered records disappear without omission notices.
 - Text is folded into one line, limited to 300 body characters by default. Set `--max-chars N`, or `0` for unlimited. Truncation is marked at the line's end; navigation columns are not truncated.
 - Established metadata such as usage and signatures stays in details. New types, blocks, and unrecognized fields use compact `key=value` output. There are no per-tool summary templates.
 - Times use local `HH:mm:ss`, without a time label or milliseconds. The date appears in the session header and on cross-day records. Sorting and time filtering retain full precision.
 
-## Filters and presets
+## Views and filters
+
+`--view story|trace` selects a view; without `--view` everything is displayed. Views are option bundles — the same selectors, filtering, and renderer as everywhere else:
+
+| View | Keeps | Hides | Body length |
+| --- | --- | --- | --- |
+| `story` | real user and assistant prose, including text written before a call | thinking, tool calls/results, images, capability recommendations (`capability-prefetch`), records left without a body | `0` (unlimited) |
+| `trace` | dialogue, call requests, behaviour recommendations and warnings | thinking, tool results, image data | `300` |
+
+- `story` keeps mid-conversation user corrections and generates no summaries. Its empty-shell suppression is part of the view: a message whose every content part was filtered out disappears entirely. Without `--view`, custom `--only`/`--exclude` keep their current behavior — filtered envelopes still display as `content=[]` rows.
+- Explicit `--only` replaces the view's inclusion list, `--exclude` appends to its exclusions (exclusion wins), and `--max-chars` overrides its length default.
+- `pi-snap --list-views` (no session needed) shows each view's purpose, what it hides, and its selector defaults; views are defined once in `VIEWS`.
 
 `--only TYPES` includes matching objects and their subtrees. `--exclude TYPES` removes matching subtrees and takes precedence. Options accept comma-separated values and can be repeated. Matching is recursive, exact, and case-sensitive against string-valued `type`, `role`, and `customType`. Qualify selectors such as `--only role:assistant` or `--only type:new-event`; values containing a colon require qualification.
 
 A mixed message can exclude thinking while retaining text and calls. Selecting only a descendant preserves its source and ancestor path without unrelated siblings. Structural matching is neither execution evidence nor secret redaction.
 
-| Preset | Include | Exclude |
-| --- | --- | --- |
-| `all` (default) | everything | none |
-| `conversation` | `role:user,role:assistant` | `type:thinking,type:toolCall` |
-| `tools` | `type:toolCall,role:toolResult` | none |
-| `trajectory` | `role:user,role:assistant,type:toolCall,customType:capability-prefetch,customType:capability-trajectory-warning` | `type:thinking,role:toolResult,type:image` |
+## Type discovery
 
-Explicit `--only` replaces the preset's inclusion list, `--exclude` adds exclusions, and `--max-chars` overrides length. All presets use the same single-line renderer. New types display by default; an inclusion list determines whether they are selected.
+`pi-snap SESSION --list-types` lists the structure paths that actually occur, with a copyable qualified selector per line:
+
+```text
+$.message.role                                 role:user
+$.message.content[].type                       type:toolCall
+$.details.prefetch.rounds[].messages[].role    role:toolResult
+```
+
+Array positions collapse to `[]`; identical path+selector pairs are listed once. Discovery runs on the current branch (or `--all`) and supports `--since`/`--before`/`--since-time`/`--before-time`, always before any view or filter selection — types a view hides stay discoverable. It combines with nothing else (views, filters, length, `--tail`, entry, `--json`, `--fork`) and fails with a clear error. Discovery reads structure only: strings are never parsed as nested JSON and prose never becomes an event. Unknown plugin fields are listed without interpretation.
 
 ## Navigation and timing
 
@@ -77,11 +95,11 @@ pi --session ./retry.jsonl
 
 Export follows `parentId` through the selected record, inclusive, including on another branch. Requires Pi v3, a non-existing destination, and an existing parent directory. The new header gets a fresh session ID, timestamp, and `parentSession`; other fields are preserved. Files, processes, and external services are not restored.
 
-Export cannot be combined with filters, ranges, length, presets, or `--json`. Malformed lines, invalid/duplicate IDs, broken/cyclic ancestry, invalid compaction references, and unpaired tool results fail. Choose a point before a tool batch or after all its results.
+Export cannot be combined with views, filters, ranges, length, or `--json`. Malformed lines, invalid/duplicate IDs, broken/cyclic ancestry, invalid compaction references, and unpaired tool results fail. Choose a point before a tool batch or after all its results.
 
 ## Notes and tests
 
-- Default type selection includes thinking, tool results, and images. The old `--trace` is removed; use filters and presets.
+- Default type selection includes thinking, tool results, and images. The old `--trace` and `--preset` flags are removed; unknown options fail with argparse's standard error. Use `--view` or explicit filters.
 - The entire file is read before filtering; `--tail` does not reduce reading, and per-line limits are not a total output cap. Inspection warns and skips invalid lines; export rejects them.
 - Generic display cannot automatically interpret future branch, timing, or resume protocols. Logs may contain credentials. Unsaved content cannot be recovered, and missing results prove neither execution nor cancellation.
 

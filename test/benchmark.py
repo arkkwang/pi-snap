@@ -1,7 +1,7 @@
 """20,000-record core benchmark: python3 test/benchmark.py (synthetic only).
 
 Complements trajectory-benchmark.mjs: this measures bulk load/selection/export,
-not process startup. Presets and explicit filters use the same renderer.
+not process startup. Views and explicit filters use the same renderer.
 """
 import contextlib
 import importlib.util
@@ -30,8 +30,9 @@ with tempfile.TemporaryDirectory(prefix='pi snap benchmark ') as directory:
     source.write_text(''.join(json.dumps(row) + '\n' for row in rows), encoding='utf-8')
     for mode, options in [
         ('read+branch', None),
-        ('all+tail20', snap.resolve_options()),
-        ('conversation+tail20', snap.resolve_options('conversation')),
+        ('default+tail20', snap.resolve_options()),
+        ('story+tail20', snap.resolve_options('story')),
+        ('trace+tail20', snap.resolve_options('trace')),
         ('filtered+limited+tail20', snap.resolve_options(only=['type:text'], max_chars=30)),
         ('fork', None),
     ]:

@@ -36,8 +36,9 @@ try {
     ['bash-help', 'bash', [bashEntry, '--help']],
   ];
   for (const [view, options] of [
-    ['all', []],
-    ['trajectory', ['--preset', 'trajectory']],
+    ['default', []],
+    ['story', ['--view', 'story']],
+    ['trace', ['--view', 'trace']],
     ['filtered', ['--exclude', 'thinking,image', '--max-chars', '100']],
   ]) {
     const args = [file, ...options, '--tail', '160'];
@@ -54,8 +55,15 @@ try {
       const ms = performance.now() - start;
       assert.equal(result.status, 0, result.stderr || result.error?.message);
       chars = result.stdout.length;
-      if (label.endsWith('-all')) assert.ok(result.stdout.includes('private '));
-      if (label.endsWith('-trajectory')) {
+      if (label.endsWith('-default')) assert.ok(result.stdout.includes('private '));
+      if (label.endsWith('-story')) {
+        // Trailing whitespace is folded; 39 full repeats prove full-length body.
+        assert.ok(result.stdout.includes('checking '.repeat(39)));
+        assert.ok(!result.stdout.includes('private '));
+        assert.ok(!result.stdout.includes('output output'));
+        assert.ok(!result.stdout.includes('…(+'));
+      }
+      if (label.endsWith('-trace')) {
         assert.ok(result.stdout.includes('check --step'));
         assert.ok(!result.stdout.includes('private '));
         assert.ok(!result.stdout.includes('output output'));

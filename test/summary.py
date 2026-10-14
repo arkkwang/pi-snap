@@ -88,25 +88,44 @@ class StructureTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 api['parse_selectors']([bad])
 
-    def test_presets_are_only_configuration_and_overrides_compose(self):
-        self.assertEqual(set(api['PRESETS']), {'all', 'conversation', 'tools', 'trajectory'})
-        for name, base in api['PRESETS'].items():
-            with self.subTest(preset=name):
-                self.assertEqual(set(base), {'only', 'exclude', 'max_chars'})
-                self.assertEqual(base['max_chars'], 300)
-                self.assertEqual(api['resolve_options'](name), api['resolve_options'](
-                    only=base['only'], exclude=base['exclude'], max_chars=base['max_chars']))
-        opts = api['resolve_options']('conversation', ['customType:new'], ['type:image'], 7)
+    def test_views_are_only_configuration_and_overrides_compose(self):
+        self.assertEqual(set(api['VIEWS']), {'story', 'trace'})
+        for name, base in api['VIEWS'].items():
+            with self.subTest(view=name):
+                self.assertEqual(set(base), {'purpose', 'hidden', 'only', 'exclude', 'max_chars'}
+                                 | ({'require_body'} if 'require_body' in base else set()))
+                opts = api['resolve_options'](name)
+                self.assertEqual(opts['only'], api['parse_selectors'](base['only']))
+                self.assertEqual(opts['exclude'], api['parse_selectors'](base['exclude']))
+                self.assertEqual(opts['max_chars'], base['max_chars'])
+                self.assertEqual(opts['require_body'], bool(base.get('require_body')))
+        self.assertEqual(api['resolve_options']()['max_chars'], api['DEFAULT_MAX_CHARS'])
+        self.assertEqual(api['resolve_options'](max_chars=0)['max_chars'], 0)
+        # Unknown view names fail like the CLI instead of silently unfiltering.
+        with self.assertRaises(ValueError):
+            api['resolve_options']('nope')
+        opts = api['resolve_options']('story', ['customType:new'], ['type:new-image'], 7)
         self.assertEqual(opts['only'], (('customType', 'new'),))
-        self.assertEqual(opts['exclude'], (('type', 'thinking'), ('type', 'toolCall'), ('type', 'image')))
+        self.assertEqual(opts['exclude'], (*api['parse_selectors'](api['VIEWS']['story']['exclude']),
+                                           ('type', 'new-image')))
         self.assertEqual(opts['max_chars'], 7)
-        # Prove max_chars defaults are configuration, not hard-coded preset branches.
-        api['PRESETS']['all']['max_chars'] = 9
+        self.assertTrue(opts['require_body'])
+        self.assertFalse(api['resolve_options']('trace')['require_body'])
+        # Prove max_chars defaults are configuration, not hard-coded view branches.
+        api['VIEWS']['story']['max_chars'] = 9
         try:
-            self.assertEqual(api['resolve_options']()['max_chars'], 9)
-            self.assertEqual(api['resolve_options'](max_chars=0)['max_chars'], 0)
+            self.assertEqual(api['resolve_options']('story')['max_chars'], 9)
         finally:
-            api['PRESETS']['all']['max_chars'] = 300
+            api['VIEWS']['story']['max_chars'] = 0
+
+    def test_node_tags_drive_match_and_chain(self):
+        node = dict(type='custom_message', customType='vendor:event')
+        self.assertEqual(api['node_tags'](node), (('type', 'custom_message'), ('customType', 'vendor:event')))
+        self.assertEqual(api['node_tags']([node]), ())
+        self.assertEqual(api['node_tags'](dict(type=['x'])), ())
+        self.assertEqual(api['tag_chain'](dict(type='message'), node, dict(type='toolCall')),
+                         'type:message > type:custom_message+customType:vendor:event > type:toolCall')
+        self.assertEqual(api['tag_chain']({}, 'not a dict'), 'record')
 
     def test_full_detail_keeps_strings_and_all_metadata(self):
         record = dict(type='future-event', id='long-navigation-id', long_field_name='中文' * 1000,

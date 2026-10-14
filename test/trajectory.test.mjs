@@ -1,4 +1,4 @@
-// npm launcher acceptance: compact rows, composable presets and raw evidence.
+// npm launcher acceptance: compact rows, composable views and raw evidence.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
@@ -55,44 +55,61 @@ test('default compact output preserves content and unknown types but not known m
   for (const old of ['usage=', '未记录结果', '响应已中断', '显示 ', '省略前', '看某条完整内容']) {
     assert.ok(!out.includes(old), old);
   }
-  assert.ok(rows(out).some(line => line.startsWith('[   3] --:--:-- [→ delegate]')));
-  assert.equal(output(entries, ['--preset', 'all']), out);
+  assert.ok(rows(out).some(line => line.startsWith('[   3] --:--:-- [type:message > role:assistant > type:toolCall] → delegate')));
   assert.match(output(entries, ['3']), /usage/);
 });
 
-test('all presets equal ordinary filters and default to 300-character row bodies', () => {
+test('views equal ordinary filters; story defaults to unlimited bodies, trace to 300', () => {
   const entries = fixture();
   const bundles = [
-    ['all', []],
-    ['conversation', ['--only', 'role:user,role:assistant', '--exclude', 'type:thinking,type:toolCall']],
-    ['tools', ['--only', 'type:toolCall,role:toolResult']],
-    ['trajectory', ['--only', 'role:user,role:assistant,type:toolCall,customType:capability-prefetch,customType:capability-trajectory-warning',
-      '--exclude', 'type:thinking,role:toolResult,type:image']],
+    ['story', ['--view', 'story'],
+      ['--only', 'role:user,role:assistant',
+       '--exclude', 'type:thinking,type:toolCall,role:toolResult,type:image,customType:capability-prefetch', '--max-chars', '0']],
+    ['trace', ['--view', 'trace'],
+      ['--only', 'role:user,role:assistant,type:toolCall,customType:capability-prefetch,customType:capability-trajectory-warning',
+       '--exclude', 'type:thinking,role:toolResult,type:image']],
   ];
-  for (const [name, args] of bundles) {
-    assert.equal(output(entries, ['--preset', name]), output(entries, [...args, '--max-chars', '300']), name);
-    assert.equal(output(entries, ['--preset', name, '--max-chars', '12']),
-      output(entries, [...args, '--max-chars', '12']), name);
+  for (const [name, view, plain] of bundles) {
+    assert.equal(output(entries, view), output(entries, plain), name);
+    assert.equal(output(entries, [...view, '--max-chars', '12']), output(entries, [...plain, '--max-chars', '12']), name);
   }
-  const conversation = output(entries, ['--preset', 'conversation']);
-  for (const keep of ['REQUEST', 'RESPONSE', 'FUTURE BLOCK']) assert.ok(conversation.includes(keep));
-  for (const omit of ['THOUGHT', 'PAYLOAD', 'RESULT BODY', 'IMAGE DATA']) assert.ok(!conversation.includes(omit));
 });
 
-test('explicit only replaces preset defaults; excludes append and remove message shells', () => {
+test('story keeps the dialogue mainline and suppresses machinery shells', () => {
   const entries = fixture();
-  const out = output(entries, ['--preset', 'conversation', '--only', 'role:toolResult', '--exclude', 'image']);
+  entries.push(msg('solo', { role: 'assistant', content: [call('bash', { command: 'echo hi' })] }));
+  entries.push(msg('u2', { role: 'user', content: '中途纠正' }));
+  const out = output(entries, ['--view', 'story']);
+  for (const keep of ['REQUEST', 'RESPONSE', '中途纠正']) assert.ok(out.includes(keep), keep);
+  for (const omit of ['THOUGHT', 'PAYLOAD', 'RESULT BODY', 'IMAGE DATA', 'DIAGNOSTIC ERROR',
+    'RECOMMENDATION', 'content=[]', 'echo hi']) assert.ok(!out.includes(omit), omit);
+  // Unknown blocks inside a real assistant message stay visible; the call-only
+  // assistant message disappears instead of leaving an empty envelope.
+  assert.ok(out.includes('FUTURE BLOCK'));
+  assert.deepEqual(rows(out).map(line => line.match(/\[\s*(\d+)\]/)[1]), ['2', '3', '3', '8']);
+  // Full bodies by default; explicit --max-chars still applies on top of the view.
+  assert.ok(output([msg('long', { role: 'user', content: '长'.repeat(400) })], ['--view', 'story']).includes('长'.repeat(400)));
+  assert.match(output([msg('long', { role: 'user', content: '长'.repeat(400) })], ['--view', 'story', '--max-chars', '40']),
+    /…\(\+\d+c\)/);
+});
+
+test('explicit only replaces view inclusion; view excludes still apply', () => {
+  const entries = fixture();
+  // A view's exclusions stay appended: replacing inclusion cannot resurrect them.
+  assert.match(output(entries, ['--view', 'trace', '--only', 'role:toolResult']), /无可显示记录/);
+  assert.match(output(entries, ['--view', 'story', '--only', 'type:toolCall']), /无可显示记录/);
+  const out = output(entries, ['--only', 'role:toolResult', '--exclude', 'image']);
   assert.ok(out.includes('RESULT BODY'));
   for (const omit of ['REQUEST', 'RESPONSE', 'IMAGE DATA']) assert.ok(!out.includes(omit));
   assert.equal(out, output(entries, ['--only', 'role:toolResult', '--exclude', 'thinking,toolCall,image']));
-  assert.match(output(entries, ['--preset', 'conversation', '--only', 'toolCall']), /无可显示记录/);
   assert.ok(!rows(output(entries, ['--exclude', 'role:assistant'])).some(line => /^\[   3\]/.test(line)));
 });
 
 test('recursive selection keeps call arguments not unrelated siblings; repeat/comma options agree', () => {
   const entries = fixture();
   const out = output(entries, ['--only', 'type:toolCall']);
-  for (const keep of ['[   3]', '[→ delegate]', 'task=work', 'content=PAYLOAD', 'model=model-name', 'DATA']) {
+  for (const keep of ['[   3]', 'type:message > role:assistant > type:toolCall] → delegate', 'task=work',
+    'content=PAYLOAD', 'model=model-name', 'DATA']) {
     assert.ok(out.includes(keep), keep);
   }
   for (const omit of ['THOUGHT', 'RESPONSE', 'FUTURE BLOCK', 'usage=', 'aborted']) assert.ok(!out.includes(omit), omit);
@@ -107,7 +124,7 @@ test('row-body limits are independent of navigation and raw detail', () => {
   assert.ok(!output(entries).includes(long));
   assert.ok(output(entries, ['--max-chars', '0']).includes(long));
   const line = rows(output(entries, ['--only', 'toolCall', '--max-chars', '10']))[0];
-  assert.match(line, /^\[   1\] --:--:-- \[→ new-tool\] .{10} …\(\+\d+c\)$/);
+  assert.match(line, /^\[   1\] --:--:-- \[type:message > role:assistant > type:toolCall\] → new-tool …\(\+\d+c\)$/);
   assert.equal((line.match(/…\(/g) || []).length, 1);
   assert.deepEqual(JSON.parse(output(entries, ['1', '--json'])), sourceRows(entries)[0]);
   assert.deepEqual(JSON.parse(output(entries, ['long-record-id', '--json'])), sourceRows(entries)[0]);
@@ -128,14 +145,14 @@ test('prefetch splits readable recommendation and execution rows with one source
   }
   assert.ok(rows(out).length >= 3);
   assert.ok(rows(out).every(line => line.startsWith('[   1] ')));
-  assert.match(out, /\[recommend → bash\] command=actual-command/);
-  assert.match(out, /\[recommend ← bash\].*HOST RESULT/);
-  const trajectory = output([host], ['--preset', 'trajectory', '--tail', '1', '--max-chars', '0']);
-  assert.ok(trajectory.includes('RECOMMENDATION'));
-  assert.ok(trajectory.includes('actual-command'));
-  assert.ok(!trajectory.includes('HOST RESULT'));
+  assert.match(out, /capability-prefetch > role:assistant > type:toolCall\] → bash command=actual-command/);
+  assert.match(out, /capability-prefetch > role:toolResult\] ← bash .*HOST RESULT/);
+  const trace = output([host], ['--view', 'trace', '--tail', '1', '--max-chars', '0']);
+  assert.ok(trace.includes('RECOMMENDATION'));
+  assert.ok(trace.includes('actual-command'));
+  assert.ok(!trace.includes('HOST RESULT'));
   assert.deepEqual(JSON.parse(output([host], ['1', '--json'])), sourceRows([host])[0]);
-  assert.ok(output([msg('wrapped', { ...host, role: 'custom' })], ['--preset', 'trajectory']).includes('RECOMMENDATION'));
+  assert.ok(output([msg('wrapped', { ...host, role: 'custom' })], ['--view', 'trace']).includes('RECOMMENDATION'));
 });
 
 test('diagnostics and new warnings are selected by exact customType', () => {
@@ -146,16 +163,22 @@ test('diagnostics and new warnings are selected by exact customType', () => {
   assert.ok(!out.includes('RESULT BODY'));
   assert.match(output(fixture(), ['--only', 'customType:capability-prefetch']), /无可显示记录/);
   const warning = { type: 'custom_message', customType: 'capability-trajectory-warning', id: 'warning', content: 'REVIEW WARNING' };
-  assert.match(output([warning], ['--preset', 'trajectory']), /REVIEW WARNING/);
+  assert.match(output([warning], ['--view', 'trace']), /REVIEW WARNING/);
 });
 
-test('retired trace and conflicting/invalid options fail through launcher', () => {
-  const trace = invoke(fixture(), ['--trace']);
-  assert.equal(trace.status, 2);
-  assert.match(trace.stderr, /--trace 已移除/);
-  assert.match(trace.stderr, /--preset tools/);
+test('retired flags and conflicting/invalid options fail through launcher', () => {
+  // --trace and --preset are gone: argparse rejects them as unknown arguments.
+  for (const args of [['--trace'], ['--preset', 'tools'], ['--view', 'nope']]) {
+    const result = invoke(fixture(), args);
+    assert.equal(result.status, 2, args.join(' '));
+    assert.match(result.stderr, /unrecognized arguments|invalid choice/, args.join(' '));
+  }
+  const views = spawnSync(process.execPath, [cli, '--list-views'], { encoding: 'utf8' });
+  assert.equal(views.status, 0, views.stderr);
+  assert.match(views.stdout, /story[\s\S]*trace/);
   for (const args of [['--only', ''], ['--exclude', 'name:read'], ['--max-chars', '-1'],
-    ['3', '--preset', 'tools'], ['3', '--json', '--max-chars', '10']]) {
+    ['3', '--view', 'trace'], ['3', '--json', '--max-chars', '10'],
+    ['--list-types', '--view', 'story'], ['--list-views', '--tail', '2']]) {
     assert.equal(invoke(fixture(), args).status, 2, args.join(' '));
   }
 });

@@ -56,17 +56,51 @@ for expected in "session $S1" 'provider=anthropic' 'modelId=test-model' \
 done
 grep -q '被回退的消息' <<<"$out" && fail 'snap: 回退分支不应出现'
 
-# 显式筛选才精简；--trace 不再悄悄选择旧 renderer。
+# 显式筛选才精简；旧 flag 不再存在，argparse 按未知参数拒绝。
 out="$(run aaa11111 --exclude thinking,role:toolResult)"
 grep -q '内部思考不应出现\|line1\|No such file' <<<"$out" && fail 'exclude: 排除子树仍出现'
 grep -q 'path=/tmp/a.py' <<<"$out" || fail 'exclude: 无关调用应保留'
 set +e; out="$(run aaa11111 --trace)"; code=$?; set -e
-[[ $code == 2 ]] || fail "--trace 应退出 2 (实际 $code)"
-grep -q -- '--preset tools' <<<"$out" || fail '--trace: 缺迁移提示'
+[[ $code == 2 ]] || fail "--trace 已移除，未知参数应退出 2 (实际 $code)"
+grep -q 'unrecognized arguments' <<<"$out" || fail '--trace: 应报未知参数'
+set +e; run aaa11111 --preset tools >/dev/null 2>&1; code=$?; set -e
+[[ $code == 2 ]] || fail "--preset 已移除，未知参数应退出 2 (实际 $code)"
+
+# ── 视图: story 通读主线 / trace 跟踪执行 ────────────────────────────────
+out="$(run aaa11111 --view story)"
+grep -q '内部思考不应出现\|path=/tmp/a.py\|line1\|cat: /tmp/a.py\|读文件然后跑 bash' <<<"$out"     && fail 'story: thinking/工具/结果/摘要不应出现'
+grep -q '看看这个文件' <<<"$out" || fail 'story: 用户正文缺失'
+grep -q '我来读一下。' <<<"$out" || fail 'story: 调用前说明缺失'
+grep -q '改用 bash 跑一下' <<<"$out" || fail 'story: 中途用户纠正被裁掉'
+grep -q 'content=\[\]' <<<"$out" && fail 'story: 无正文空壳应抑制'
+out="$(run aaa11111 --view trace)"
+grep -q 'type:message > role:assistant > type:toolCall] → bash' <<<"$out" || fail 'trace: 调用发起缺失'
+grep -q '内部思考不应出现\|No such file or directory' <<<"$out" && fail 'trace: thinking/工具结果应隐藏'
+grep -q '改用 bash 跑一下' <<<"$out" || fail 'trace: 对话缺失'
+# 默认视图仍完整展示(含 thinking 与结果)
+out="$(run aaa11111)"
+grep -q '内部思考不应出现' <<<"$out" || fail '默认视图: thinking 应完整展示'
+grep -q 'No such file or directory' <<<"$out" || fail '默认视图: 工具结果应完整展示'
+
+# ── --list-views / --list-types ──────────────────────────────────────────
+out="$($snap --list-views 2>/dev/null)"
+grep -q 'story' <<<"$out" || fail 'list-views: 缺 story'
+grep -q 'trace' <<<"$out" || fail 'list-views: 缺 trace'
+grep -q 'capability-prefetch' <<<"$out" || fail 'list-views: 应说明隐藏内容'
+set +e; run aaa11111 --list-views >/dev/null 2>&1; code=$?; set -e
+[[ $code == 2 ]] || fail 'list-views: 带 session 应报错'
+out="$(run aaa11111 --list-types)"
+grep -q '\$\.message\.content\[\]\.type' <<<"$out" || fail 'list-types: 缺内容块路径'
+grep -q 'type:toolCall' <<<"$out" || fail 'list-types: 缺限定选择器'
+grep -q 'role:toolResult' <<<"$out" || fail 'list-types: 缺消息角色'
+out="$(run aaa11111 --all --list-types)"
+grep -q 'type:message' <<<"$out" || fail 'list-types: --all 应列出全部记录类型'
+set +e; run aaa11111 --list-types --view story >/dev/null 2>&1; code=$?; set -e
+[[ $code == 2 ]] || fail 'list-types: 与 view 混用应报错'
 
 # ── --all: 回退条目带 ~ 标记 ────────────────────────────────────────────────
 out="$(run aaa11111 --all)"
-grep -q '~\[   6\].*\[user\]' <<<"$out" || fail '--all: 回退条目应带 ~ 标记'
+grep -q '~\[   6\].*type:message > role:user' <<<"$out" || fail '--all: 回退条目应带 ~ 标记'
 grep -q '被回退的消息' <<<"$out" || fail '--all: 回退条目正文缺失'
 
 # ── --tail 按原始记录计数 ──────────────────────────────────────────────────

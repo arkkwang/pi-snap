@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # pi-snap — 通用 Pi 会话记录读取、筛选、展示与分叉导出。
-# JSON 结构是展示底座；未知字段不需要注册，预设只是筛选和长度配置。
+# JSON 结构是展示底座；未知字段不需要注册，视图只是筛选和长度配置。
 # 分支按文件最后一条记录的 parentId 链选择，不推断运行时游标或执行状态。
 # 已知 Pi 时间语义单独适配；预取的执行时间与落盘时间不混用。
 import argparse
@@ -12,18 +12,28 @@ import sys
 from datetime import datetime, timezone
 from uuid import uuid4
 
-# Presets contain only ordinary options. No preset-specific rendering paths.
-PRESETS = {
-    "all": {"only": (), "exclude": (), "max_chars": 300},
-    "conversation": {"only": ("role:user", "role:assistant"),
-                     "exclude": ("type:thinking", "type:toolCall"), "max_chars": 300},
-    "tools": {"only": ("type:toolCall", "role:toolResult"),
-              "exclude": (), "max_chars": 300},
-    "trajectory": {"only": ("role:user", "role:assistant", "type:toolCall",
-                            "customType:capability-prefetch",
-                            "customType:capability-trajectory-warning"),
-                   "exclude": ("type:thinking", "role:toolResult", "type:image"),
-                   "max_chars": 300},
+# Views are ordinary option bundles. No view-specific rendering paths.
+# story hides machinery rows and keeps full-length bodies for reading;
+# trace keeps dialogue, call requests and behaviour recommendations.
+DEFAULT_MAX_CHARS = 300
+VIEWS = {
+    "story": {
+        "purpose": "通读对话主线：保留用户与 assistant 的真实正文（含调用前说明），正文默认完整不截断",
+        "hidden": "隐藏 thinking、工具调用/结果、图片、能力推荐（capability-prefetch）与无正文空壳",
+        "only": ("role:user", "role:assistant"),
+        "exclude": ("type:thinking", "type:toolCall", "role:toolResult",
+                    "type:image", "customType:capability-prefetch"),
+        "max_chars": 0,
+        "require_body": True,
+    },
+    "trace": {
+        "purpose": "跟踪对话与执行：保留对话、工具调用发起与行为推荐/提醒",
+        "hidden": "隐藏 thinking、工具结果与图片数据",
+        "only": ("role:user", "role:assistant", "type:toolCall",
+                 "customType:capability-prefetch", "customType:capability-trajectory-warning"),
+        "exclude": ("type:thinking", "role:toolResult", "type:image"),
+        "max_chars": DEFAULT_MAX_CHARS,
+    },
 }
 TAG_FIELDS = ("type", "role", "customType")
 CONTEXT_FIELDS = frozenset((*TAG_FIELDS, "id", "parentId", "timestamp"))
@@ -391,19 +401,44 @@ def parse_selectors(values):
     return tuple(selectors)
 
 
-def resolve_options(preset="all", only=None, exclude=None, max_chars=None):
-    base = PRESETS[preset]
+def resolve_options(view=None, only=None, exclude=None, max_chars=None):
+    """Compose a view's defaults with explicit overrides into ordinary options.
+
+    --only replaces the view inclusion list; --exclude appends to its
+    exclusions; --max-chars overrides its length. Without a view, no filtering.
+    """
+    if view is None:
+        base = {}
+    elif view in VIEWS:
+        base = VIEWS[view]
+    else:
+        raise ValueError(f"未知视图 {view!r}；可选: {', '.join(sorted(VIEWS))}")
     return {
-        "only": parse_selectors(base["only"] if only is None else only),
-        "exclude": parse_selectors((*base["exclude"], *(exclude or ()))),
-        "max_chars": base["max_chars"] if max_chars is None else max_chars,
+        "only": parse_selectors(base.get("only", ()) if only is None else only),
+        "exclude": parse_selectors((*base.get("exclude", ()), *(exclude or ()))),
+        "max_chars": base.get("max_chars", DEFAULT_MAX_CHARS) if max_chars is None else max_chars,
+        "require_body": bool(base.get("require_body")),
     }
 
 
+def node_tags(node):
+    """String-valued TAG_FIELDS on one node; shared by match, discovery, display."""
+    if not isinstance(node, dict):
+        return ()
+    return tuple((key, node[key]) for key in TAG_FIELDS if isinstance(node.get(key), str))
+
+
 def matches(node, selectors):
-    return any(any(isinstance(node.get(field), str) and node[field] == value
-                   for field in ((key,) if key else TAG_FIELDS))
+    tags = dict(node_tags(node))
+    return any(tags.get(key) == value if key else value in tags.values()
                for key, value in selectors)
+
+
+def tag_chain(*nodes):
+    """Qualified tag ancestry along the rendering path; never invented nodes."""
+    links = ["+".join(f"{key}:{value}" for key, value in node_tags(node))
+             for node in nodes if node_tags(node)]
+    return " > ".join(links) or "record"
 
 
 def filter_record(record, only=(), exclude=()):
@@ -550,22 +585,47 @@ def preparation_content(body):
     return result, messages
 
 
-def record_rows(record, clock=None):
-    """Yield (label, body, clock) using basic content shapes plus one fallback."""
+def projected_has_body(record):
+    """View-level empty-shell check (story); other records always keep rows.
+
+    Only message-shaped records can reduce to an empty content envelope when
+    every part was filtered out. The check belongs to view configuration, so
+    custom --only/--exclude keep composing on top and default/custom views
+    still show their own rows unchanged.
+    """
+    if not isinstance(record, dict):
+        return True
+    message = record.get("message")
+    if record.get("type") == "message" and isinstance(message, dict):
+        body = message
+    elif record.get("type") == "custom_message":
+        body = record
+    else:
+        return True
+    body, prepared = preparation_content(body)
+    content = body.get("content", OMIT)
+    if isinstance(content, list):
+        return bool(content) or bool(prepared)
+    return True
+
+
+def record_rows(record, clock=None, head=None):
+    """Yield (chain, body, clock) using basic content shapes plus one fallback.
+
+    The chain is the real tag ancestry (record -> message -> part) taken from
+    the source; extracted preparation rows keep their host record tags instead
+    of masquerading as top-level assistant messages. Tool names live in the
+    body (call arrow / result arrow).
+    """
     clock = record_clock(record) if clock is None else clock
     message = record.get("message")
     wrapped = record.get("type") == "message" and isinstance(message, dict)
-    body = message if wrapped else record
-    body, prepared = preparation_content(body)
+    raw_body = message if wrapped else record
+    if head is None:
+        head = (record, raw_body) if wrapped else (record,)
+    body, prepared = preparation_content(raw_body)
     is_message = wrapped or record.get("type") == "custom_message"
-    if is_message:
-        label = next((body[key] for key in ("customType", "role", "type")
-                      if isinstance(body.get(key), str)), "record")
-    else:
-        label = "/".join(body[key] for key in TAG_FIELDS if isinstance(body.get(key), str)) or "record"
     result_message = is_message and body.get("role") == "toolResult"
-    if result_message:
-        label = "← " + str(body.get("toolName", "?"))
     metadata = MESSAGE_METADATA if wrapped else frozenset()
     consumed = (CONTEXT_FIELDS | metadata | {"content"}) - {
         key for key in TAG_FIELDS if key in body and not isinstance(body[key], str)}
@@ -578,46 +638,44 @@ def record_rows(record, clock=None):
     content = body.get("content", OMIT)
     parts = content if isinstance(content, list) else [content] if content is not OMIT else []
     for part in parts:
-        part_label = label
+        chain_nodes = head
         if not isinstance(part, dict):
             text = inline_value(part)
         else:
+            chain_nodes = head + (part,)
             kind = part.get("type")
             consumed_part = {"type"} if isinstance(kind, str) else set()
             if kind in ("text", "thinking") and isinstance(part.get(kind), str):
                 text = inline_value(part[kind])
                 consumed_part = consumed_part | BLOCK_METADATA | {kind}
-                if kind == "thinking":
-                    part_label = "thinking"
             elif kind == "toolCall":
-                part_label = "→ " + str(part.get("name", "?"))
                 args = part.get("arguments", OMIT)
-                text = inline_fields(args) if isinstance(args, dict) else (
+                args_text = inline_fields(args) if isinstance(args, dict) else (
                     "arguments=" + inline_value(args) if args is not OMIT else "")
+                text = "→ " + str(part.get("name", "?")) + ((" " + args_text) if args_text else "")
                 consumed_part = consumed_part | {"id", "name", "arguments"}
             else:
-                part_label = str(kind) if isinstance(kind, str) else label
                 # Tool-result blocks retain result attribution, including images.
-                if result_message:
-                    part_label = label + ("/" + str(kind) if kind else "")
                 text = ""
             extra = inline_fields({key: value for key, value in part.items() if key not in consumed_part})
             text = " · ".join(value for value in (text, extra) if value)
-        rows.append((part_label, text or "{}", clock))
+        if result_message:
+            text = " ".join(value for value in ("← " + str(body.get("toolName", "?")), text) if value)
+        rows.append((tag_chain(*chain_nodes), text or "{}", clock))
     extra = inline_fields(extras)
     if outer:
         extra = ", ".join(value for value in (extra, "entry=(" + inline_fields(outer) + ")") if value)
     if rows:
-        first_label, first_text, _ = rows[0]
-        rows[0] = (first_label, " · ".join(value for value in (first_text, extra) if value), clock)
+        first_chain, first_text, _ = rows[0]
+        rows[0] = (first_chain, " · ".join(value for value in (first_text, extra) if value), clock)
     elif extra or not prepared or content is not OMIT:
-        rows.append((label, extra or ("content=" + inline_value(content) if content is not OMIT else "{}"), clock))
+        rows.append((tag_chain(*head), extra or ("content=" + inline_value(content) if content is not OMIT else "{}"), clock))
     for item in prepared:
         child = {"type": "message", "message": item}
         # Never inherit the batch/persistence time for a message with no timestamp.
         child_clock = record_clock(child)
-        for child_label, text, when in record_rows(child, child_clock):
-            rows.append(("recommend " + child_label, text, when))
+        for child_chain, text, when in record_rows(child, child_clock, head + (item,)):
+            rows.append((child_chain, text, when))
     return rows
 
 
@@ -647,29 +705,43 @@ def render_record(record, number, width=4, mark="", max_chars=300, clock=None, r
         print(f"{mark}[{number:>{width}}] {short_time(stamp, ref_date)} [{one_line(label)}] {text}{note}")
 
 
-def render_snapshot(entries, path, show_all, tail, since=None, before=None,
-                    options=None, since_time=None, before_time=None):
+def record_window(entries, show_all, since=None, before=None,
+                   since_time=None, before_time=None):
+    """Branch/range/time record selection shared by snapshots and discovery."""
+    if show_all and (since is not None or before is not None):
+        die("--all 不能与 --since 或 --before 混用，避免跨分支区间")
     chain, _ = active_branch(entries)
     root = next((e for e in entries if e.get("type") == "session"), None)
-    if show_all and (since is not None or before is not None):
-        die("区间查询不能与 --all 混用；请使用当前分支的记录 ID")
     branch = list(chain)
     if root is not None and not any(e is root for e in branch):
         branch.insert(0, root)
     selected = select_range(entries, entries if show_all else branch, since, before)
+    if since_time is None and before_time is None:
+        return selected, branch, root, 0
+    kept, unknown = [], 0
+    for record in selected:
+        clock = record_clock(record)
+        unknown += int(clock["missing"])
+        if any((since_time is None or stamp >= since_time)
+               and (before_time is None or stamp < before_time) for stamp in clock["times"]):
+            kept.append(record)
+    return kept, branch, root, unknown
+
+
+def render_snapshot(entries, path, show_all, tail, since=None, before=None,
+                    options=None, since_time=None, before_time=None):
+    selected, branch, root, unknown_times = record_window(
+        entries, show_all, since, before, since_time, before_time)
     options = options or resolve_options()
     numbers = {id(entry): number for number, entry in enumerate(entries, 1)}
     visible = []
-    unknown_times = 0
     for record, clock in timed_records(selected, reorder=not show_all):
-        if since_time is not None or before_time is not None:
-            unknown_times += int(clock["missing"])
-            if not any((since_time is None or stamp >= since_time)
-                       and (before_time is None or stamp < before_time) for stamp in clock["times"]):
-                continue
         projected = filter_record(record, options["only"], options["exclude"])
-        if projected is not OMIT:
-            visible.append((projected, clock, numbers[id(record)]))
+        if projected is OMIT:
+            continue
+        if options["require_body"] and not projected_has_body(projected):
+            continue
+        visible.append((projected, clock, numbers[id(record)]))
     if unknown_times:
         print(f"pi-snap: {unknown_times} 条记录部分或全部时间未知，未知部分不能按时间筛选。", file=sys.stderr)
     if tail is not None:
@@ -774,6 +846,50 @@ def list_sessions(sessions_dir):
         if len(dupes) > LIST_LIMIT:
             print(dim(f"  … 还有 {len(dupes) - LIST_LIMIT} 个"))
 
+# ── 视图与类型发现 ──────────────────────────────────────────────
+def list_views():
+    """Views are documented once here and in VIEWS; no session required."""
+    print(bold("views") + dim(" · pi-snap SESSION --view NAME；不指定 --view 时完整展示"))
+    for name, view in VIEWS.items():
+        print(f"{bold(name)}  {view['purpose']}；{view['hidden']}")
+        print(dim(f"  --only {','.join(view['only'])}"
+                  f" --exclude {','.join(view['exclude'])}"
+                  f" --max-chars {view['max_chars']}"))
+
+def discover_types(records):
+    """(path, selector) pairs actually present; no plugin semantics guessed.
+
+    Shares node_tags with filtering and display. Array positions collapse to
+    []; an identical path+selector pair is reported once. Strings are never
+    parsed as nested JSON, and prose is never treated as an event.
+    """
+    found = {}
+
+    def walk(node, path):
+        if isinstance(node, dict):
+            for key, value in node_tags(node):
+                found.setdefault((f"{path}.{key}", f"{key}:{value}"))
+            for key, child in node.items():
+                walk(child, f"{path}.{key}")
+        elif isinstance(node, list):
+            for child in node:
+                walk(child, f"{path}[]")
+
+    for record in records:
+        walk(record, "$")
+    return sorted(found)
+
+def list_types(records, scope):
+    """Copyable qualified selectors with the actual structure paths."""
+    rows = discover_types(records)
+    print(bold(f"{len(rows)} 个结构标签")
+          + dim(f" · {len(records)} 条记录 · {scope} · 选择器用于 --only / --exclude"))
+    width = max((len(path) for path, _ in rows), default=0)
+    for path, selector in rows:
+        print(f"{path:<{width}}  {selector}")
+    if not rows:
+        print(dim("未发现 type/role/customType 标签。"))
+
 # ── 单条完整视图 ─────────────────────────────────────────────────────────────
 def find_entry(entries, ref):
     if ref.startswith("id:"):
@@ -821,24 +937,28 @@ def main(argv=None):
         description="通用 Pi 会话记录读取、筛选与展示。默认紧凑单行，按序号展开完整记录；不修改源会话。",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="示例:\n"
-               "  pi-snap SESSION --exclude thinking,image --max-chars 300\n"
-               "  pi-snap SESSION --only user,assistant\n"
-               "  pi-snap SESSION --preset tools --since ID1 --before ID2\n"
+               "  pi-snap --list-views                 # 查看两种视图及默认筛选\n"
+               "  pi-snap SESSION --view story         # 通读对话主线，正文完整不截断\n"
+               "  pi-snap SESSION --view trace         # 对话、调用发起与行为推荐\n"
+               "  pi-snap SESSION --list-types         # 实际结构标签路径与可复制选择器\n"
+               "  pi-snap SESSION --only user,assistant --exclude thinking,image\n"
+               "  pi-snap SESSION --view story --since ID1 --before ID2\n"
                "  pi-snap SESSION ENTRY --json\n"
                "  pi-snap SESSION ENTRY --fork ./retry.jsonl\n\n"
-               "类型匹配对象的 type / role / customType，可用 role:user 等限定字段。\n"
-               "筛选递归作用于嵌套对象；排除优先。预设仅提供普通参数默认值。\n"
-               "all: 不筛选；conversation: 只选 user/assistant，排除 thinking/toolCall；\n"
-               "tools: 只选 toolCall/toolResult；trajectory: 对话、调用发起及行为推荐。\n"
+               "类型匹配对象的 type / role / customType，可用 role:user 等限定字段；行首标签链显示真实来源嵌套。\n"
+               "筛选递归作用于嵌套对象；排除优先。视图只是筛选与长度默认值，不足之处可用 --only/--exclude/--max-chars 调整。\n"
                "序号先于筛选生成，至少4位右对齐。预取使用执行时间，完整时间在详情中查看。输出未经脱敏。")
     ap.add_argument("session", nargs="?", help="会话头 id / 文件名前缀，或 JSONL 文件路径")
     ap.add_argument("entry", nargs="?", help="记录序号或原始 ID／唯一前缀；纯数字原始 ID 使用 id: 前缀")
     ap.add_argument("--session-dir", metavar="PATH", help="会话根目录（默认 ~/.pi/agent/sessions）")
     ap.add_argument("--all", action="store_true", help="包含其他分支，保持文件顺序")
-    ap.add_argument("--only", action="append", metavar="TYPES", help="只选指定类型，逗号分隔，可重复；替换预设 only")
-    ap.add_argument("--exclude", action="append", metavar="TYPES", help="排除指定类型及其子树，逗号分隔，可重复；追加到预设 exclude")
-    ap.add_argument("--preset", choices=PRESETS, help="普通参数预设（默认 all）；不是独立视图")
-    ap.add_argument("--max-chars", type=int, metavar="N", help="每行正文最多 N 个字符（默认 300）；0 不限，定位列不截断")
+    ap.add_argument("--view", choices=sorted(VIEWS), metavar="VIEW",
+                    help="视图 story(通读对话主线) 或 trace(对话/调用发起/行为推荐)；不指定则完整展示")
+    ap.add_argument("--list-views", action="store_true", help="列出视图名称与说明，不需要 session")
+    ap.add_argument("--list-types", action="store_true", help="列出实际结构标签路径与限定选择器；先于视图/筛选发现，可配 --all 与区间")
+    ap.add_argument("--only", action="append", metavar="TYPES", help="只选指定类型，逗号分隔，可重复；替换视图 only")
+    ap.add_argument("--exclude", action="append", metavar="TYPES", help="排除指定类型及其子树，逗号分隔，可重复；追加到视图 exclude")
+    ap.add_argument("--max-chars", type=int, metavar="N", help="每行正文最多 N 个字符（默认 300，story 为 0 不限）；定位列不截断")
     ap.add_argument("--since", metavar="REF", help="从当前分支记录序号或原始 ID 开始，包含该记录")
     ap.add_argument("--before", metavar="REF", help="在当前分支记录序号或原始 ID 之前结束，不含该记录")
     ap.add_argument("--since-time", metavar="ISO", help="事件/执行时间起点（包含）；ISO 8601，必须带时区")
@@ -846,27 +966,35 @@ def main(argv=None):
     ap.add_argument("--tail", type=int, metavar="N", help="筛选后最后 N 条原始记录（正整数），不是内容块数")
     ap.add_argument("--json", action="store_true", help="配合 entry: 输出原始 JSON")
     ap.add_argument("--fork", metavar="PATH", help="导出截至 entry(含)的独立 v3 会话；目标必须不存在，不恢复环境")
-    ap.add_argument("--trace", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
 
-    if args.trace:
-        ap.error("--trace 已移除：使用 --preset tools 选择工具记录，或 --exclude thinking,image --max-chars 300 精简输出；不再提供旧摘要视图")
     display_options = (args.only is not None or args.exclude is not None
-                       or args.preset is not None or args.max_chars is not None)
+                       or args.view is not None or args.max_chars is not None)
     selection_options = (args.tail is not None or args.all
                          or args.since is not None or args.before is not None
                          or args.since_time is not None or args.before_time is not None)
+    if args.list_views:
+        if args.session or args.entry or display_options or selection_options \
+                or args.json or args.fork is not None:
+            ap.error("--list-views 不需要 session，也不能与其他参数混用")
+    elif args.list_types:
+        if args.entry or args.json or args.fork is not None or args.tail is not None:
+            ap.error("--list-types 不能与单条、--json、--fork 或 --tail 混用")
+        if display_options:
+            ap.error("--list-types 先于视图与筛选发现类型，不能与 --view、--only、--exclude 或 --max-chars 混用")
+        if not args.session:
+            ap.error("--list-types 需要指定 session")
     if args.fork is not None:
         if not args.session or not args.entry:
             ap.error("--fork 需要指定 session 和 entry id")
         if args.json or display_options or selection_options:
-            ap.error("--fork 不能与 --json、筛选、预设、长度或区间参数一起使用")
+            ap.error("--fork 不能与 --json、视图、筛选、长度或区间参数一起使用")
     if args.json and not args.entry:
         ap.error("--json 需要指定 entry id")
     if (display_options or selection_options) and not args.session:
-        ap.error("筛选、预设、长度与区间参数需要指定 session")
+        ap.error("视图、筛选、长度与区间参数需要指定 session")
     if args.entry and (display_options or selection_options):
-        ap.error("单条详情不能与筛选、预设、长度或区间参数一起使用")
+        ap.error("单条详情不能与视图、筛选、长度或区间参数一起使用")
     if args.tail is not None and args.tail <= 0:
         ap.error("--tail 必须是正整数")
     if args.max_chars is not None and args.max_chars < 0:
@@ -885,13 +1013,16 @@ def main(argv=None):
     if since_time is not None and before_time is not None and since_time > before_time:
         ap.error("--since-time 起点在 --before-time 终点之后")
     try:
-        options = resolve_options(args.preset or "all", args.only, args.exclude, args.max_chars)
+        options = resolve_options(args.view, args.only, args.exclude, args.max_chars)
     except ValueError as exc:
         ap.error(str(exc))
 
     sessions_dir = (os.path.expanduser(args.session_dir)
                     if args.session_dir else DEFAULT_SESSIONS_DIR)
 
+    if args.list_views:
+        list_views()
+        return
     if not args.session:
         list_sessions(sessions_dir)
         return
@@ -906,6 +1037,14 @@ def main(argv=None):
             return
     except (OSError, UnicodeError) as exc:
         die(str(exc))
+
+    if args.list_types:
+        selected, _, _, unknown = record_window(entries, args.all, args.since, args.before,
+                                               since_time, before_time)
+        if unknown:
+            print(f"pi-snap: {unknown} 条记录部分或全部时间未知，未知部分不能按时间筛选。", file=sys.stderr)
+        list_types(selected, "全部记录" if args.all else "当前分支")
+        return
 
     if args.entry:
         chain, _ = active_branch(entries)
